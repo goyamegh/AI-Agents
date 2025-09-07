@@ -464,28 +464,32 @@ export class LangGraphAgent implements BaseAgent {
       prompt: '> '
     });
 
-    this.rl.prompt();
-
-    this.rl.on('line', async (line) => {
-      const input = line.trim();
-      
-      if (input.toLowerCase() === 'exit' || input.toLowerCase() === 'quit') {
-        console.log('👋 Goodbye!');
-        this.cleanup();
-        process.exit(0);
-      }
-
-      if (input) {
-        await this.sendMessage(input);
-      }
-
+    // Return a Promise that resolves only when user quits
+    return new Promise<void>((resolve) => {
       this.rl!.prompt();
-    });
 
-    this.rl.on('close', () => {
-      console.log('\n👋 Goodbye!');
-      this.cleanup();
-      process.exit(0);
+      this.rl!.on('line', async (line) => {
+        const input = line.trim();
+        
+        if (input.toLowerCase() === 'exit' || input.toLowerCase() === 'quit') {
+          console.log('👋 Goodbye!');
+          this.cleanup();
+          resolve(); // Resolve the Promise instead of calling process.exit(0)
+          return;
+        }
+
+        if (input) {
+          await this.sendMessage(input);
+        }
+
+        this.rl!.prompt();
+      });
+
+      this.rl!.on('close', () => {
+        console.log('\n👋 Goodbye!');
+        this.cleanup();
+        resolve(); // Resolve the Promise instead of calling process.exit(0)
+      });
     });
   }
 
