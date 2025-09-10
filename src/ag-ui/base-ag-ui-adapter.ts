@@ -59,6 +59,7 @@ export class BaseAGUIAdapter {
   // State management for AG UI events
   private conversationState: State = {};
   private stateHistory: State[] = [];
+  private pendingToolEvents: BaseEvent[] = [];
 
   constructor(agent: BaseAgent, config: BaseAGUIConfig = {}, logger?: Logger, auditLogger?: AGUIAuditLogger) {
     this.agent = agent;
@@ -157,11 +158,11 @@ export class BaseAGUIAdapter {
     this.conversationState = initialState;
     this.stateHistory.push(initialState);
 
-    observer.next({
+    this.emitAndAuditEvent({
       type: EventType.STATE_SNAPSHOT,
       snapshot: initialState,
       timestamp: Date.now()
-    } as StateSnapshotEvent);
+    } as StateSnapshotEvent, observer, input.threadId, input.runId);
 
     try {
       // Extract the last user message text from AG UI format
@@ -178,12 +179,12 @@ export class BaseAGUIAdapter {
         throw new Error('No text content found in user message');
       }
 
-      // Emit step started for agent processing
-      observer.next({
-        type: EventType.STEP_STARTED,
-        stepName: `${agentType}_agent_processing`,
-        timestamp: Date.now()
-      } as StepStartedEvent);
+      // Don't emit STEP_STARTED before TEXT_MESSAGE_START - it causes event ordering issues
+      // this.emitAndAuditEvent({
+      //   type: EventType.STEP_STARTED,
+      //   stepName: `${agentType}_agent_processing`,
+      //   timestamp: Date.now()
+      // } as StepStartedEvent, observer, input.threadId, input.runId);
 
       // Emit thinking start for agent reasoning
       // observer.next({
@@ -199,15 +200,15 @@ export class BaseAGUIAdapter {
 
       // Emit text message start event
       const messageId = uuidv4();
-      observer.next({
+      this.emitAndAuditEvent({
         type: EventType.TEXT_MESSAGE_START,
         messageId,
         role: 'assistant',
         timestamp: Date.now()
-      } as TextMessageStartEvent);
+      } as TextMessageStartEvent, observer, input.threadId, input.runId);
 
       // Run the agent with streaming integration
-      await this.runAgentWithStreamingEvents(messageText, messageId, observer);
+      await this.runAgentWithStreamingEvents(messageText, messageId, observer, input.threadId, input.runId);
 
       // Emit thinking end after agent reasoning
       // observer.next({
@@ -220,24 +221,21 @@ export class BaseAGUIAdapter {
       //   timestamp: Date.now()
       // } as ThinkingEndEvent);
 
+      // Don't emit STEP_FINISHED for agent_processing - we removed the corresponding STEP_STARTED
+      // this.emitAndAuditEvent({
+      //   type: EventType.STEP_FINISHED,
+      //   stepName: `${agentType}_agent_processing`,
+      //   timestamp: Date.now()
+      // } as StepFinishedEvent, observer, input.threadId, input.runId);
 
-            // Emit text message end
-      observer.next({
+      // Emit text message end FIRST to close the message stream
+      this.emitAndAuditEvent({
         type: EventType.TEXT_MESSAGE_END,
         messageId,
         timestamp: Date.now()
-      } as TextMessageEndEvent);
+      } as TextMessageEndEvent, observer, input.threadId, input.runId);
 
-      // Emit step finished for agent processing
-      observer.next({
-        type: EventType.STEP_FINISHED,
-        stepName: `${agentType}_agent_processing`,
-        timestamp: Date.now()
-      } as StepFinishedEvent);
-
-
-
-      // Emit final state delta before run completion using JSON Patch format
+      // Emit final state delta AFTER text message end
       const finalStateDelta = [{
         op: 'add',
         path: '/conversationCompleted',
@@ -248,11 +246,11 @@ export class BaseAGUIAdapter {
         }
       }];
 
-      observer.next({
+      this.emitAndAuditEvent({
         type: EventType.STATE_DELTA,
         delta: finalStateDelta,
         timestamp: Date.now()
-      } as StateDeltaEvent);
+      } as StateDeltaEvent, observer, input.threadId, input.runId);
 
       // Emit run finished event
       this.emitAndAuditEvent({
@@ -300,184 +298,189 @@ export class BaseAGUIAdapter {
   private async runAgentWithStreamingEvents(
     userMessage: string, 
     messageId: string, 
-    observer: any
+    observer: any,
+    threadId: string,
+    runId: string
   ): Promise<void> {
     const agentType = this.agent.getAgentType();
     try {
       // Create callbacks to convert agent events to AG UI events
       const callbacks: StreamingCallbacks = {
         onTextStart: (text: string) => {
-          observer.next({
+          this.emitAndAuditEvent({
             type: EventType.TEXT_MESSAGE_CONTENT,
             messageId,
             delta: text,
             timestamp: Date.now()
-          } as TextMessageContentEvent);
+          } as TextMessageContentEvent, observer, threadId, runId);
         },
         onTextDelta: (delta: string) => {
-          observer.next({
+          this.emitAndAuditEvent({
             type: EventType.TEXT_MESSAGE_CONTENT,
             messageId,
             delta,
             timestamp: Date.now()
-          } as TextMessageContentEvent);
+          } as TextMessageContentEvent, observer, threadId, runId);
         },
         onToolUseStart: (toolName: string, toolUseId: string, input: any) => {
           // Emit proper TOOL_CALL_START event
           const actualToolName = toolName.split('__')[1] || toolName;
           
-          // Emit step started for tool execution
-          observer.next({
-            type: EventType.STEP_STARTED,
-            stepName: `tool_execution_${actualToolName}`,
-            timestamp: Date.now()
-          } as StepStartedEvent);
+          // Don't emit STEP_STARTED during TEXT_MESSAGE - it causes event ordering issues
+          // this.emitAndAuditEvent({
+          //   type: EventType.STEP_STARTED,
+          //   stepName: `tool_execution_${actualToolName}`,
+          //   timestamp: Date.now()
+          // } as StepStartedEvent, observer, threadId, runId);
 
           // Emit thinking start for tool decision
-          // observer.next({
+          // this.emitAndAuditEvent({
           //   type: EventType.THINKING_START,
           //   timestamp: Date.now()
-          // } as ThinkingStartEvent);
+          // } as ThinkingStartEvent, observer, threadId, runId);
 
-          // observer.next({
+          // this.emitAndAuditEvent({
           //   type: EventType.THINKING_TEXT_MESSAGE_START,
           //   title: `Executing ${actualToolName}`,
           //   timestamp: Date.now()
-          // });
+          // }, observer, threadId, runId);
           
-          observer.next({
+          this.emitAndAuditEvent({
             type: EventType.TOOL_CALL_START,
             toolCallId: toolUseId,
             toolCallName: actualToolName,
             timestamp: Date.now()
-          } as ToolCallStartEvent);
+          } as ToolCallStartEvent, observer, threadId, runId);
 
           // Emit tool arguments as JSON string
-          observer.next({
+          this.emitAndAuditEvent({
             type: EventType.TOOL_CALL_ARGS,
             toolCallId: toolUseId,
             delta: JSON.stringify(input),
             timestamp: Date.now()
-          } as ToolCallArgsEvent);
+          } as ToolCallArgsEvent, observer, threadId, runId);
 
           // Also add a text message for visibility in the chat
-          observer.next({
+          this.emitAndAuditEvent({
             type: EventType.TEXT_MESSAGE_CONTENT,
             messageId,
             delta: `\n\n🔧 Using tool: ${actualToolName}`,
             timestamp: Date.now()
-          } as TextMessageContentEvent);
+          } as TextMessageContentEvent, observer, threadId, runId);
         },
         onToolResult: (toolName: string, toolUseId: string, result: any) => {
-          // Emit proper TOOL_CALL_RESULT event
           const actualToolName = toolName.split('__')[1] || toolName;
-          observer.next({
+          
+          // Emit TOOL_CALL_END event FIRST
+          this.emitAndAuditEvent({
+            type: EventType.TOOL_CALL_END,
+            toolCallId: toolUseId,
+            timestamp: Date.now()
+          } as ToolCallEndEvent, observer, threadId, runId);
+
+          // Then emit TOOL_CALL_RESULT event
+          this.emitAndAuditEvent({
             type: EventType.TOOL_CALL_RESULT,
             toolCallId: toolUseId,
             content: JSON.stringify(result),
             messageId: uuidv4(),
             timestamp: Date.now()
-          } as ToolCallResultEvent);
-
-          // Emit TOOL_CALL_END event
-          observer.next({
-            type: EventType.TOOL_CALL_END,
-            toolCallId: toolUseId,
-            timestamp: Date.now()
-          } as ToolCallEndEvent);
+          } as ToolCallResultEvent, observer, threadId, runId);
 
           // Track state changes after tool completion using JSON Patch format
-          const stateDelta = [{
-            op: 'add',
-            path: `/toolExecutions/${toolUseId}`,
-            value: {
-              toolName: actualToolName,
-              timestamp: Date.now()
-            }
-          }];
+          // NOTE: We cannot emit STATE_DELTA during TEXT_MESSAGE streaming
+          // It will be accumulated and emitted before TEXT_MESSAGE_END
+          // const stateDelta = [{
+          //   op: 'add',
+          //   path: `/toolExecutions/${toolUseId}`,
+          //   value: {
+          //     toolName: actualToolName,
+          //     timestamp: Date.now()
+          //   }
+          // }];
 
-          observer.next({
-            type: EventType.STATE_DELTA,
-            delta: stateDelta,
-            timestamp: Date.now()
-          } as StateDeltaEvent);
+          // this.emitAndAuditEvent({
+          //   type: EventType.STATE_DELTA,
+          //   delta: stateDelta,
+          //   timestamp: Date.now()
+          // } as StateDeltaEvent, observer, threadId, runId);
 
           // Emit thinking end for tool completion
-          // observer.next({
+          // this.emitAndAuditEvent({
           //   type: EventType.THINKING_TEXT_MESSAGE_END,
           //   timestamp: Date.now()
-          // });
+          // }, observer, threadId, runId);
 
-          // observer.next({
+          // this.emitAndAuditEvent({
           //   type: EventType.THINKING_END,
           //   timestamp: Date.now()
-          // } as ThinkingEndEvent);
+          // } as ThinkingEndEvent, observer, threadId, runId);
 
-          // Emit step finished for tool execution
-          observer.next({
-            type: EventType.STEP_FINISHED,
-            stepName: `tool_execution_${actualToolName}`,
-            timestamp: Date.now()
-          } as StepFinishedEvent);
+          // Don't emit STEP_FINISHED during TEXT_MESSAGE - it causes event ordering issues
+          // this.emitAndAuditEvent({
+          //   type: EventType.STEP_FINISHED,
+          //   stepName: `tool_execution_${actualToolName}`,
+          //   timestamp: Date.now()
+          // } as StepFinishedEvent, observer, threadId, runId);
 
           // Also add a text message for visibility in the chat
           const resultText = `\n\n✅ Tool ${actualToolName} result:\n${JSON.stringify(result, null, 2)}`;
-          observer.next({
+          this.emitAndAuditEvent({
             type: EventType.TEXT_MESSAGE_CONTENT,
             messageId,
             delta: resultText,
             timestamp: Date.now()
-          } as TextMessageContentEvent);
+          } as TextMessageContentEvent, observer, threadId, runId);
         },
         onToolError: (toolName: string, toolUseId: string, error: string) => {
           // Emit RUN_ERROR for tool failures
           const actualToolName = toolName.split('__')[1] || toolName;
           
           // Emit thinking end for failed tool execution
-          // observer.next({
+          // this.emitAndAuditEvent({
           //   type: EventType.THINKING_TEXT_MESSAGE_END,
           //   timestamp: Date.now()
-          // });
+          // }, observer, threadId, runId);
 
-          // observer.next({
+          // this.emitAndAuditEvent({
           //   type: EventType.THINKING_END,
           //   timestamp: Date.now()
-          // } as ThinkingEndEvent);
+          // } as ThinkingEndEvent, observer, threadId, runId);
 
-          // Emit step finished for failed tool execution
-          observer.next({
-            type: EventType.STEP_FINISHED,
-            stepName: `tool_execution_${actualToolName}`,
-            timestamp: Date.now()
-          } as StepFinishedEvent);
+          // Don't emit STEP_FINISHED during TEXT_MESSAGE - it causes event ordering issues
+          // this.emitAndAuditEvent({
+          //   type: EventType.STEP_FINISHED,
+          //   stepName: `tool_execution_${actualToolName}`,
+          //   timestamp: Date.now()
+          // } as StepFinishedEvent, observer, threadId, runId);
           
-          observer.next({
+          this.emitAndAuditEvent({
             type: EventType.RUN_ERROR,
             message: `Tool ${actualToolName} failed: ${error}`,
             code: 'TOOL_ERROR',
             timestamp: Date.now()
-          } as RunErrorEvent);
+          } as RunErrorEvent, observer, threadId, runId);
 
           // Also add a text message for visibility in the chat
           const errorText = `\n\n❌ Tool ${actualToolName} error: ${error}`;
-          observer.next({
+          this.emitAndAuditEvent({
             type: EventType.TEXT_MESSAGE_CONTENT,
             messageId,
             delta: errorText,
             timestamp: Date.now()
-          } as TextMessageContentEvent);
+          } as TextMessageContentEvent, observer, threadId, runId);
         },
         onTurnComplete: () => {
           // Turn completed - the calling method will handle message end events
         },
         onError: (error: string) => {
           // Emit error as text content
-          observer.next({
+          this.emitAndAuditEvent({
             type: EventType.TEXT_MESSAGE_CONTENT,
             messageId,
             delta: `\n\nError: ${error}`,
             timestamp: Date.now()
-          } as TextMessageContentEvent);
+          } as TextMessageContentEvent, observer, threadId, runId);
         }
       };
 
@@ -493,12 +496,12 @@ export class BaseAGUIAdapter {
       });
       
       // Emit error as text content
-      observer.next({
+      this.emitAndAuditEvent({
         type: EventType.TEXT_MESSAGE_CONTENT,
         messageId,
         delta: `Error: ${errorMessage}`,
         timestamp: Date.now()
-      } as TextMessageContentEvent);
+      } as TextMessageContentEvent, observer, threadId, runId);
     }
   }
 

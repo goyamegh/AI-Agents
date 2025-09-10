@@ -217,9 +217,7 @@ WARNING: This failure has been recorded. After ${this.MAX_RETRY_ATTEMPTS} identi
         description: tool.description,
         inputSchema: tool.inputSchema
       }));
-      this.logger.info(`Loaded ${this.tools.length} tools from ${this.serverName}`, {
-        tools: this.tools.map(t => t.name)
-      });
+      this.logger.info(`Loaded ${this.tools.length} tools from ${this.serverName}`);
     } catch (error) {
       this.logger.error(`Failed to load tools from ${this.serverName}`, { error });
       throw error;

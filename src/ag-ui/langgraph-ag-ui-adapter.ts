@@ -41,6 +41,8 @@ export class LangGraphAGUIAdapter extends BaseAGUIAdapter {
   private langGraphAgent: LangGraphAgent;
   private graphState: LangGraphState = {};
   private activeSteps = new Set<string>();
+  private textMessageActive = false;
+  private pendingStepEvents: BaseEvent[] = [];
   
   constructor(agent: LangGraphAgent, config: BaseAGUIConfig = {}, logger?: Logger, auditLogger?: AGUIAuditLogger) {
     super(agent, config, logger, auditLogger);
@@ -70,10 +72,29 @@ export class LangGraphAGUIAdapter extends BaseAGUIAdapter {
       
       // Clear active steps at start
       this.activeSteps.clear();
+      this.textMessageActive = false;
+      this.pendingStepEvents = [];
 
       // Subscribe to base events and enhance them
       const subscription = baseObservable.subscribe({
         next: (event: BaseEvent) => {
+          // Track text message state
+          if (event.type === EventType.TEXT_MESSAGE_START) {
+            this.textMessageActive = true;
+          } else if (event.type === EventType.TEXT_MESSAGE_END) {
+            this.textMessageActive = false;
+            
+            // Forward the TEXT_MESSAGE_END event FIRST
+            observer.next(event);
+            
+            // Then emit any pending step events AFTER TEXT_MESSAGE_END
+            for (const pendingEvent of this.pendingStepEvents) {
+              observer.next(pendingEvent);
+            }
+            this.pendingStepEvents = [];
+            
+            return; // Don't forward TEXT_MESSAGE_END again
+          }
           // Emit LangGraph-specific state after RUN_STARTED
           if (event.type === EventType.RUN_STARTED && !runStartedEmitted) {
             runStartedEmitted = true;
@@ -109,25 +130,27 @@ export class LangGraphAGUIAdapter extends BaseAGUIAdapter {
             const stepEvent = event as StepStartedEvent;
             
             // Track graph node transitions
-            if (stepEvent.stepName?.includes('_agent_processing')) {
-              this.emitNodeTransition(observer, 'processInput');
-            }
+            // Don't emit node transitions during text message - causes event ordering issues
+            // if (stepEvent.stepName?.includes('_agent_processing')) {
+            //   this.emitNodeTransition(observer, 'processInput');
+            // }
           } else if (event.type === EventType.TOOL_CALL_START) {
             // Track tool execution in graph state
             this.graphState.toolCallsPending = (this.graphState.toolCallsPending || 0) + 1;
-            this.emitNodeTransition(observer, 'executeTools');
+            // Don't emit node transitions for tool events - they're handled during deferred processing
+            // this.emitNodeTransition(observer, 'executeTools');
           } else if (event.type === EventType.TOOL_CALL_END) {
             // Update tool completion tracking
             this.graphState.toolCallsCompleted = (this.graphState.toolCallsCompleted || 0) + 1;
             this.graphState.toolCallsPending = Math.max(0, (this.graphState.toolCallsPending || 0) - 1);
             
-            // Check if we're looping back to callModel
-            if (this.graphState.iterations! < this.graphState.maxIterations!) {
-              this.emitNodeTransition(observer, 'callModel');
-              this.graphState.iterations = (this.graphState.iterations || 0) + 1;
-            } else {
-              this.emitNodeTransition(observer, 'generateResponse');
-            }
+            // Don't emit node transitions for tool events - they're handled during deferred processing
+            // if (this.graphState.iterations! < this.graphState.maxIterations!) {
+            //   this.emitNodeTransition(observer, 'callModel');
+            //   this.graphState.iterations = (this.graphState.iterations || 0) + 1;
+            // } else {
+            //   this.emitNodeTransition(observer, 'generateResponse');
+            // }
           } else if (event.type === EventType.RUN_FINISHED) {
             // Before forwarding RUN_FINISHED, emit all our final events
             
@@ -169,7 +192,29 @@ export class LangGraphAGUIAdapter extends BaseAGUIAdapter {
             } as StateSnapshotEvent);
           }
           
-          // Forward all events
+          // Filter events based on text message state
+          if (this.textMessageActive && 
+              (event.type === EventType.STEP_STARTED || 
+               event.type === EventType.STEP_FINISHED ||
+               event.type === EventType.STATE_SNAPSHOT ||
+               event.type === EventType.STATE_DELTA)) {
+            // Don't forward these state events during text message - defer them until after TEXT_MESSAGE_END
+            this.pendingStepEvents.push(event);
+            return;
+          }
+          
+          // Defer tool call events during text message
+          if (this.textMessageActive && 
+              (event.type === EventType.TOOL_CALL_START ||
+               event.type === EventType.TOOL_CALL_END ||
+               event.type === EventType.TOOL_CALL_ARGS ||
+               event.type === EventType.TOOL_CALL_RESULT)) {
+            // Store tool events for later emission
+            this.pendingStepEvents.push(event);
+            return;
+          }
+          
+          // Forward all other events
           observer.next(event);
         },
         error: (err) => observer.error(err),
@@ -188,6 +233,82 @@ export class LangGraphAGUIAdapter extends BaseAGUIAdapter {
    * Emit node transition events for graph visualization
    */
   private emitNodeTransition(observer: any, nodeName: string): void {
+    // If text message is active, defer the step events
+    if (this.textMessageActive) {
+      this.deferStepEventsForNode(nodeName);
+      return;
+    }
+    
+    this.emitStepEventsForNode(observer, nodeName);
+  }
+  
+  /**
+   * Store step events for later emission when text message ends
+   */
+  private deferStepEventsForNode(nodeName: string): void {
+    // Update graph state
+    const previousNode = this.graphState.currentNode;
+    this.graphState.currentNode = nodeName;
+    this.graphState.graphPath = [...(this.graphState.graphPath || []), nodeName];
+    
+    // Track node execution count
+    if (!this.graphState.nodeExecutions) {
+      this.graphState.nodeExecutions = {};
+    }
+    this.graphState.nodeExecutions[nodeName] = (this.graphState.nodeExecutions[nodeName] || 0) + 1;
+
+    // Create step events but don't emit them yet
+    const stepName = `graph_node_${nodeName}`;
+    this.activeSteps.add(stepName);
+    
+    // Store STEP_STARTED event
+    this.pendingStepEvents.push({
+      type: EventType.STEP_STARTED,
+      stepName,
+      metadata: {
+        previousNode,
+        currentNode: nodeName,
+        iteration: this.graphState.iterations,
+        executionCount: this.graphState.nodeExecutions[nodeName]
+      },
+      timestamp: Date.now()
+    } as StepStartedEvent);
+
+    // Store STATE_SNAPSHOT event
+    this.pendingStepEvents.push({
+      type: EventType.STATE_SNAPSHOT,
+      snapshot: {
+        graphType: 'LangGraph',
+        currentNode: nodeName,
+        previousNode,
+        graphPath: this.graphState.graphPath,
+        nodeExecutions: this.graphState.nodeExecutions,
+        iterations: this.graphState.iterations,
+        toolCallsPending: this.graphState.toolCallsPending,
+        toolCallsCompleted: this.graphState.toolCallsCompleted,
+        nodes: ['processInput', 'callModel', 'executeTools', 'generateResponse']
+      },
+      timestamp: Date.now()
+    } as StateSnapshotEvent);
+
+    // Store STEP_FINISHED for previous node
+    if (previousNode && previousNode !== 'START') {
+      const previousStepName = `graph_node_${previousNode}`;
+      this.activeSteps.delete(previousStepName);
+      
+      this.pendingStepEvents.push({
+        type: EventType.STEP_FINISHED,
+        stepName: previousStepName,
+        timestamp: Date.now()
+      } as StepFinishedEvent);
+    }
+  }
+  
+  /**
+   * Emit step events immediately
+   */
+  private emitStepEventsForNode(observer: any, nodeName: string): void {
+    // This is the original implementation moved here
     // Update graph state
     const previousNode = this.graphState.currentNode;
     this.graphState.currentNode = nodeName;

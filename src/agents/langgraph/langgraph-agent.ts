@@ -230,16 +230,61 @@ export class LangGraphAgent implements BaseAgent {
     });
 
     try {
+      this.logger.info('LLM Request to Bedrock', {
+        modelId: "us.anthropic.claude-sonnet-4-20250514-v1:0",
+        systemPromptLength: this.systemPrompt.length,
+        messageCount: bedrockMessages.length,
+        toolCount: tools.length,
+        maxTokens: 4096,
+        temperature: 0
+      });
+
       const response = await this.bedrockClient.send(command);
       const processedResponse = await this.processStreamingResponse(response, streamingCallbacks);
       
+      this.logger.info('LLM Response from Bedrock', {
+        responseMessageLength: processedResponse.message.content.length,
+        toolCallsCount: processedResponse.toolCalls?.length || 0,
+        toolCallNames: processedResponse.toolCalls?.map(tc => tc.toolName) || []
+      });
+
+      // Only add the assistant message if it has actual content
+      // When the model only returns tool calls, there's no text to add
+      const updatedMessages = processedResponse.message.content.trim() 
+        ? [...messages, processedResponse.message]
+        : messages;
+
       return {
-        messages: [...messages, processedResponse.message],
+        messages: updatedMessages,
         toolCalls: processedResponse.toolCalls || [],
         currentStep: "callModel"
       };
     } catch (error) {
-      this.logger.error('Error calling model', { error });
+      // Enhanced error logging to capture all error details
+      this.logger.error('Error calling model', { 
+        error,
+        errorName: error?.name,
+        errorMessage: error?.message,
+        errorStack: error?.stack,
+        errorCode: error?.code,
+        errorType: typeof error,
+        errorKeys: error ? Object.keys(error) : [],
+        errorString: String(error)
+      });
+
+      // Handle credential expiration
+      if (error?.name === 'ExpiredTokenException' || error?.name === 'CredentialsProviderError') {
+        streamingCallbacks?.onError?.('AWS credentials expired. Please refresh your credentials and try again.');
+        return {
+          shouldContinue: false,
+          currentStep: "callModel"
+        };
+      }
+      
+      // Return error message to streaming callbacks
+      const errorMessage = error?.message || error?.name || String(error) || 'Unknown error occurred';
+      streamingCallbacks?.onError?.(errorMessage);
+      
       return {
         shouldContinue: false,
         currentStep: "callModel"
@@ -251,26 +296,61 @@ export class LangGraphAgent implements BaseAgent {
     const { toolCalls, streamingCallbacks } = state;
     const toolResults: Record<string, any> = {};
 
+    this.logger.info('Executing tools', {
+      toolCallsCount: toolCalls.length,
+      toolNames: toolCalls.map(tc => tc.toolName)
+    });
+
     for (const toolCall of toolCalls) {
       const { toolName, toolUseId, input } = toolCall;
+      
+      this.logger.info('Tool execution started', {
+        toolName,
+        toolUseId,
+        input
+      });
       
       streamingCallbacks?.onToolUseStart?.(toolName, toolUseId, input);
       
       try {
         const result = await this.executeToolCall(toolName, input);
         toolResults[toolUseId] = result;
+        
+        this.logger.info('Tool execution completed', {
+          toolName,
+          toolUseId,
+          resultType: typeof result,
+          resultKeys: result && typeof result === 'object' ? Object.keys(result) : [],
+          resultLength: typeof result === 'string' ? result.length : undefined
+        });
+        
         streamingCallbacks?.onToolResult?.(toolName, toolUseId, result);
       } catch (error) {
         const errorMessage = error instanceof Error ? error.message : String(error);
+        
+        this.logger.error('Tool execution failed', {
+          toolName,
+          toolUseId,
+          error: errorMessage,
+          input
+        });
+        
         streamingCallbacks?.onToolError?.(toolName, toolUseId, errorMessage);
         toolResults[toolUseId] = { error: errorMessage };
       }
     }
 
+    this.logger.info('All tools executed', {
+      toolResultsCount: Object.keys(toolResults).length,
+      successfulTools: Object.entries(toolResults).filter(([, result]) => !result.error).length,
+      failedTools: Object.entries(toolResults).filter(([, result]) => result.error).length
+    });
+
     return {
       toolResults: { ...state.toolResults, ...toolResults },
       toolCalls: [], // Clear tool calls after execution
-      currentStep: "executeTools"
+      currentStep: "executeTools",
+      iterations: state.iterations + 1 // Increment iterations after tool execution
     };
   }
 
@@ -336,11 +416,64 @@ export class LangGraphAgent implements BaseAgent {
             result.message.content += delta.text;
           } else if (delta?.toolUse && result.toolCalls.length > 0) {
             const lastToolCall = result.toolCalls[result.toolCalls.length - 1];
-            lastToolCall.input = JSON.parse(delta.toolUse.input);
+            try {
+              // Handle streaming JSON input - may be incomplete
+              if (delta.toolUse.input) {
+                // Accumulate input if it's incomplete
+                if (!lastToolCall.inputBuffer) {
+                  lastToolCall.inputBuffer = '';
+                }
+                lastToolCall.inputBuffer += delta.toolUse.input;
+                
+                // Try to parse the accumulated input
+                try {
+                  lastToolCall.input = JSON.parse(lastToolCall.inputBuffer);
+                } catch (parseError) {
+                  // JSON is incomplete, continue accumulating
+                  // Don't log this as it's expected during streaming
+                }
+              }
+            } catch (error) {
+              this.logger.warn('Error processing tool use delta', { 
+                error: error.message,
+                input: delta.toolUse.input,
+                toolCall: lastToolCall
+              });
+            }
           }
         }
       }
     }
+
+    // Final cleanup - ensure all tool inputs are properly parsed
+    for (const toolCall of result.toolCalls) {
+      if (toolCall.inputBuffer && !toolCall.input) {
+        try {
+          toolCall.input = JSON.parse(toolCall.inputBuffer);
+        } catch (error) {
+          this.logger.error('Failed to parse final tool input', {
+            error: error.message,
+            buffer: toolCall.inputBuffer,
+            toolCall: toolCall.toolName
+          });
+          toolCall.input = {}; // Fallback to empty object
+        }
+      }
+      // Clean up the buffer
+      delete toolCall.inputBuffer;
+    }
+
+    // Log the complete assembled response
+    this.logger.info('Complete LLM Response Assembled', {
+      messageRole: result.message.role,
+      messageContent: result.message.content,
+      toolCallsCount: result.toolCalls.length,
+      toolCalls: result.toolCalls.map(tc => ({
+        toolName: tc.toolName,
+        toolUseId: tc.toolUseId,
+        input: tc.input
+      }))
+    });
 
     return result;
   }
