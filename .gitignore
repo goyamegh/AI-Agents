@@ -3,6 +3,7 @@
 /dist
 /coverage
 CLAUDE.md
+settings.local.json
 
 # Environment variables
 .env
@@ -25,3 +26,8 @@ ehthumbs.db
 Thumbs.db
 
 opensearch-config.yml
+
+design.excalidraw
+HOLMESGPT*
+
+*/prompts/*
