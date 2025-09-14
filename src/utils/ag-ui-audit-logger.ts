@@ -18,6 +18,21 @@ export class AGUIAuditLogger extends BaseLogger {
   }
 
   /**
+   * Convert Unix timestamp to human-readable format
+   */
+  private toHumanTimestamp(unixTimestamp: number): string {
+    return new Date(unixTimestamp).toLocaleString('en-US', {
+      year: 'numeric',
+      month: 'short',
+      day: '2-digit',        hour: '2-digit',
+      minute: '2-digit',
+      second: '2-digit',
+      hour12: true,
+      timeZoneName: 'short'
+    });
+  }
+
+  /**
    * Start audit logging for a request
    */
   startRequest(threadId: string, runId: string): void {
@@ -36,6 +51,7 @@ export class AGUIAuditLogger extends BaseLogger {
     const entry = {
       timestamp: timestamp.unix,
       iso_timestamp: timestamp.iso,
+      human_timestamp: this.toHumanTimestamp(timestamp.unix),
       event_type: 'REQUEST_START',
       thread_id: threadId,
       run_id: runId
@@ -60,12 +76,14 @@ export class AGUIAuditLogger extends BaseLogger {
     const entry = {
       timestamp: timestamp.unix,
       iso_timestamp: timestamp.iso,
+      human_timestamp: this.toHumanTimestamp(timestamp.unix),
       event_type: 'AG_UI_EVENT',
       thread_id: threadId,
       run_id: runId,
       ag_ui_event: {
         type: event.type,
         timestamp: event.timestamp,
+        timestamp_human: this.toHumanTimestamp(event.timestamp),
         ...this.sanitizeEvent(event)
       }
     };
@@ -89,6 +107,7 @@ export class AGUIAuditLogger extends BaseLogger {
     const entry = {
       timestamp: timestamp.unix,
       iso_timestamp: timestamp.iso,
+      human_timestamp: this.toHumanTimestamp(timestamp.unix),
       event_type: 'HTTP_REQUEST',
       thread_id: threadId,
       run_id: runId,
@@ -114,6 +133,7 @@ export class AGUIAuditLogger extends BaseLogger {
     const entry = {
       timestamp: timestamp.unix,
       iso_timestamp: timestamp.iso,
+      human_timestamp: this.toHumanTimestamp(timestamp.unix),
       event_type: 'VALIDATION_ERROR',
       thread_id: threadId,
       run_id: runId,
@@ -138,6 +158,7 @@ export class AGUIAuditLogger extends BaseLogger {
     const entry = {
       timestamp: timestamp.unix,
       iso_timestamp: timestamp.iso,
+      human_timestamp: this.toHumanTimestamp(timestamp.unix),
       event_type: 'REQUEST_END',
       thread_id: threadId,
       run_id: runId,

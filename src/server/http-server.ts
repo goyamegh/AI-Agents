@@ -268,8 +268,28 @@ export class HTTPServer {
         if (!msg.role || typeof msg.role !== 'string') {
           errors.push(`messages[${index}].role must be a string`);
         }
-        if (!msg.content || (typeof msg.content !== 'string' && !Array.isArray(msg.content))) {
-          errors.push(`messages[${index}].content must be a string or array`);
+        
+        // Assistant messages with toolCalls may not have content
+        const isAssistantWithTools = msg.role === 'assistant' && msg.toolCalls;
+        
+        // Content is required unless it's an assistant message with tool calls
+        if (!isAssistantWithTools) {
+          if (!msg.content || (typeof msg.content !== 'string' && !Array.isArray(msg.content))) {
+            errors.push(`messages[${index}].content must be a string or array`);
+            // Log the problematic message for debugging
+            this.logger.warn(`Invalid message content at index ${index}`, {
+              index,
+              role: msg.role,
+              contentType: typeof msg.content,
+              contentValue: msg.content,
+              isNull: msg.content === null,
+              isUndefined: msg.content === undefined,
+              messageKeys: Object.keys(msg)
+            });
+          }
+        } else if (msg.content && typeof msg.content !== 'string' && !Array.isArray(msg.content)) {
+          // If content is provided for assistant with tools, it must be valid
+          errors.push(`messages[${index}].content must be a string or array when provided`);
         }
       });
     }

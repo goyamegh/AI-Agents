@@ -10,6 +10,10 @@ import { Logger } from '../../utils/logger';
 import { BaseAgent, StreamingCallbacks } from '../base-agent';
 import readline from 'readline';
 import { v4 as uuidv4 } from 'uuid';
+import { getPrometheusMetricsEmitter } from '../../utils/metrics-emitter';
+
+// Configuration constants
+const LANGGRAPH_MAX_ITERATIONS = 10; // Maximum tool execution cycles before forcing final response
 
 // LangGraph state interface
 export interface LangGraphAgentState {
@@ -21,6 +25,7 @@ export interface LangGraphAgentState {
   maxIterations: number;
   shouldContinue: boolean;
   streamingCallbacks?: StreamingCallbacks;
+  lastToolExecution?: number; // Timestamp of last tool execution
 }
 
 /**
@@ -145,7 +150,7 @@ export class LangGraphAgent implements BaseAgent {
         },
         maxIterations: {
           value: (x: number, y: number) => y || x,
-          default: () => 5
+          default: () => LANGGRAPH_MAX_ITERATIONS
         },
         shouldContinue: {
           value: (x: boolean, y: boolean) => y,
@@ -172,6 +177,17 @@ export class LangGraphAgent implements BaseAgent {
     this.graph.addConditionalEdges(
       "callModel" as any,
       (state: LangGraphAgentState) => {
+        // Log the decision for debugging
+        this.logger.info('🔄 Graph Decision: callModel -> next node', {
+          toolCallsCount: state.toolCalls.length,
+          hasToolCalls: state.toolCalls.length > 0,
+          iterations: state.iterations,
+          maxIterations: state.maxIterations,
+          messageCount: state.messages.length,
+          lastMessageRole: state.messages[state.messages.length - 1]?.role,
+          nextNode: state.toolCalls.length > 0 ? "executeTools" : "generateResponse"
+        });
+        
         if (state.toolCalls.length > 0) {
           return "executeTools";
         }
@@ -183,7 +199,21 @@ export class LangGraphAgent implements BaseAgent {
     this.graph.addConditionalEdges(
       "executeTools" as "__start__",
       (state: LangGraphAgentState) => {
-        if (state.iterations < state.maxIterations && state.shouldContinue) {
+        const shouldContinue = state.iterations < state.maxIterations && state.shouldContinue;
+        
+        // Log the decision for debugging
+        this.logger.info('🔄 Graph Decision: executeTools -> next node', {
+          iterations: state.iterations,
+          maxIterations: state.maxIterations,
+          shouldContinue: state.shouldContinue,
+          willContinue: shouldContinue,
+          messageCount: state.messages.length,
+          lastMessageRole: state.messages[state.messages.length - 1]?.role,
+          hasToolResults: Object.keys(state.toolResults).length > 0,
+          nextNode: shouldContinue ? "callModel" : "generateResponse"
+        });
+        
+        if (shouldContinue) {
           return "callModel";
         }
         return "generateResponse";
@@ -201,21 +231,75 @@ export class LangGraphAgent implements BaseAgent {
 
   private async processInputNode(state: LangGraphAgentState): Promise<Partial<LangGraphAgentState>> {
     // Process input and prepare for model call
+    this.logger.info('Processing input', {
+      messageCount: state.messages.length,
+      iterations: state.iterations,
+      maxIterations: state.maxIterations
+    });
+    
     return {
-      currentStep: "processInput",
-      iterations: state.iterations + 1
+      currentStep: "processInput"
+      // Don't increment iterations here - only increment after tool execution
     };
   }
 
   private async callModelNode(state: LangGraphAgentState): Promise<Partial<LangGraphAgentState>> {
-    const { messages, streamingCallbacks } = state;
+    const { messages, streamingCallbacks, iterations, toolResults } = state;
+    
+    this.logger.info('📥 callModelNode: Starting', {
+      iterations,
+      maxIterations: state.maxIterations,
+      messageCount: messages.length,
+      lastMessageRole: messages[messages.length - 1]?.role,
+      lastMessageContent: messages[messages.length - 1]?.content ? 
+        JSON.stringify(messages[messages.length - 1].content).substring(0, 100) : 'undefined'
+    });
+    
+    // Log the raw messages before processing
+    this.logger.info('Raw messages before Bedrock preparation', {
+      messages: messages.map((msg, idx) => ({
+        index: idx,
+        role: msg.role,
+        contentType: Array.isArray(msg.content) ? 'array' : typeof msg.content,
+        contentLength: Array.isArray(msg.content) ? msg.content.length : 
+                       typeof msg.content === 'string' ? msg.content.length : 0,
+        contentBlocks: Array.isArray(msg.content) ? 
+          msg.content.map((c: any) => ({
+            hasText: c.text !== undefined,
+            hasToolUse: c.toolUse !== undefined,
+            hasToolResult: c.toolResult !== undefined,
+            toolUseId: c.toolUse?.toolUseId || c.toolResult?.toolUseId
+          })) : null
+      }))
+    });
     
     // Prepare messages for Bedrock (same as Jarvis)
     const bedrockMessages = this.prepareMessagesForBedrock(messages);
     
-    // Get available tools
+    // Get available tools - but don't provide tools if we're at max iterations (to force a final response)
     const tools = this.getAllTools();
-    const toolConfig = this.prepareToolConfig(tools);
+    
+    // Check if there are tool results in the message history (properly formatted)
+    const hasToolResultsInHistory = messages.some(msg => 
+      Array.isArray(msg.content) && 
+      msg.content.some((c: any) => c.toolResult !== undefined)
+    );
+    
+    // Only disable tools if we're at max iterations to force a final response
+    // Let the model decide if it needs more tools based on the conversation context
+    const atMaxIterations = iterations >= state.maxIterations - 1;
+    const shouldDisableTools = atMaxIterations;
+    
+    this.logger.info('🔧 Tool configuration decision', {
+      hasToolResultsInHistory,
+      iterations,
+      maxIterations: state.maxIterations,
+      atMaxIterations,
+      shouldDisableTools,
+      toolCount: tools.length
+    });
+    
+    const toolConfig = shouldDisableTools ? undefined : this.prepareToolConfig(tools);
 
     // Create the command for Bedrock ConverseStream
     const command = new ConverseStreamCommand({
@@ -230,33 +314,146 @@ export class LangGraphAgent implements BaseAgent {
     });
 
     try {
+      // Log the actual messages being sent with full detail
+      this.logger.info('LLM Request Messages (detailed)', {
+        messageCount: bedrockMessages.length,
+        messages: bedrockMessages.map((msg, idx) => ({
+          index: idx,
+          role: msg.role,
+          contentLength: JSON.stringify(msg.content).length,
+          contentBlocks: msg.content.map((c: any) => ({
+            type: c.text !== undefined ? 'text' : 
+                  c.toolUse !== undefined ? 'toolUse' : 
+                  c.toolResult !== undefined ? 'toolResult' : 'unknown',
+            toolUseId: c.toolUse?.toolUseId || c.toolResult?.toolUseId,
+            hasContent: c.text?.length > 0 || c.toolUse !== undefined || c.toolResult !== undefined
+          }))
+        }))
+      });
+      
       this.logger.info('LLM Request to Bedrock', {
         modelId: "us.anthropic.claude-sonnet-4-20250514-v1:0",
         systemPromptLength: this.systemPrompt.length,
         messageCount: bedrockMessages.length,
-        toolCount: tools.length,
+        toolCount: toolConfig ? tools.length : 0,
+        toolsEnabled: !!toolConfig,
+        hasToolResultsInHistory,
+        iterations,
+        maxIterations: state.maxIterations,
+        atMaxIterations,
+        shouldDisableTools,
+        reason: shouldDisableTools ? 'max_iterations_reached' : 'tools_enabled',
         maxTokens: 4096,
         temperature: 0
       });
 
+      // Emit warning and metric if we're forcing a final response due to max iterations
+      if (atMaxIterations) {
+        this.logger.warn('MAX_ITERATIONS_REACHED: Forcing final response from LLM', {
+          iterations,
+          maxIterations: state.maxIterations,
+          messageCount: bedrockMessages.length
+        });
+        
+        // Emit Prometheus metric
+        const metricsEmitter = getPrometheusMetricsEmitter();
+        metricsEmitter.emitCounter('langgraph_agent_max_iterations_reached_total', 1, {
+          agent_type: 'langgraph',
+          max_iterations: state.maxIterations.toString()
+        });
+      }
+
       const response = await this.bedrockClient.send(command);
       const processedResponse = await this.processStreamingResponse(response, streamingCallbacks);
       
-      this.logger.info('LLM Response from Bedrock', {
-        responseMessageLength: processedResponse.message.content.length,
+      this.logger.info('📤 LLM Response from Bedrock', {
+        contentBlocksCount: processedResponse.message.content.length,
+        contentBlocks: processedResponse.message.content.map((block: any) => ({
+          type: block.text !== undefined ? 'text' : block.toolUse !== undefined ? 'toolUse' : 'unknown',
+          hasContent: block.text !== undefined ? block.text.length > 0 : block.toolUse !== undefined
+        })),
+        textContent: processedResponse.message.textContent?.length || 0,
+        textContentPreview: processedResponse.message.textContent?.substring(0, 100) || '',
         toolCallsCount: processedResponse.toolCalls?.length || 0,
-        toolCallNames: processedResponse.toolCalls?.map(tc => tc.toolName) || []
+        toolCallNames: processedResponse.toolCalls?.map(tc => tc.toolName) || [],
+        hasContent: processedResponse.message.content.length > 0,
+        hasText: processedResponse.message.textContent?.length > 0,
+        hasToolCalls: processedResponse.toolCalls?.length > 0
       });
 
-      // Only add the assistant message if it has actual content
-      // When the model only returns tool calls, there's no text to add
-      const updatedMessages = processedResponse.message.content.trim() 
-        ? [...messages, processedResponse.message]
-        : messages;
+      // Check if the response contains XML tool calls in the text (fallback for when Bedrock doesn't recognize tools)
+      let extractedToolCalls = processedResponse.toolCalls || [];
+      let assistantMessage = processedResponse.message; // Use the complete message from Bedrock
+      
+      if (extractedToolCalls.length === 0 && processedResponse.message.textContent.includes('<function_calls>')) {
+        this.logger.warn('Tool calls found in text content, attempting to parse XML');
+        extractedToolCalls = this.parseToolCallsFromXML(processedResponse.message.textContent);
+        
+        // For XML tool calls, we need to handle them differently
+        // Remove the XML from the text content
+        if (extractedToolCalls.length > 0) {
+          const xmlStart = processedResponse.message.textContent.indexOf('<function_calls>');
+          const xmlEnd = processedResponse.message.textContent.indexOf('</function_calls>') + '</function_calls>'.length;
+          const cleanedText = processedResponse.message.textContent.substring(0, xmlStart).trim();
+          
+          // Update the assistant message to remove XML from text blocks
+          assistantMessage = {
+            role: 'assistant',
+            content: cleanedText ? [{ text: cleanedText }] : []
+          };
+        }
+      }
+      
+      // Handle message history properly based on UML diagram flow
+      // First iteration: Add assistant message with tool calls
+      // Subsequent iterations: Only add assistant message if there are no tool calls (final response)
+      
+      const isFirstCallInTurn = iterations === 0;
+      
+      let updatedMessages: any[];
+      
+      if (isFirstCallInTurn) {
+        // First call in this turn - always add the assistant message
+        updatedMessages = [...messages, assistantMessage];
+        this.logger.info('📝 First iteration: Adding initial assistant message', {
+          previousMessageCount: messages.length,
+          iterations,
+          hasToolCalls: extractedToolCalls.length > 0
+        });
+      } else if (extractedToolCalls.length === 0) {
+        // Subsequent iteration with no tool calls - this is the final response
+        updatedMessages = [...messages, assistantMessage];
+        this.logger.info('📝 Final response: Adding assistant message without tool calls', {
+          previousMessageCount: messages.length,
+          iterations,
+          hasToolCalls: false
+        });
+      } else {
+        // Subsequent iteration with tool calls - DON'T add another assistant message
+        // The previous assistant message with tool_use is already in the history
+        // We just need to track the new tool calls to execute
+        this.logger.info('📝 Continuation with tools: NOT adding duplicate assistant message', {
+          previousMessageCount: messages.length,
+          iterations,
+          hasToolCalls: true,
+          reason: 'Previous assistant message with tool_use already exists'
+        });
+        updatedMessages = messages; // Keep messages as-is
+      }
+
+      this.logger.info('📊 callModelNode: Returning state', {
+        newMessageCount: updatedMessages.length,
+        messagesChanged: updatedMessages.length !== messages.length,
+        addedMessage: updatedMessages.length > messages.length,
+        toolCallsCount: extractedToolCalls.length,
+        toolCallNames: extractedToolCalls.map(tc => tc.toolName),
+        iterations,
+        isFirstCallInTurn
+      });
 
       return {
         messages: updatedMessages,
-        toolCalls: processedResponse.toolCalls || [],
+        toolCalls: extractedToolCalls,
         currentStep: "callModel"
       };
     } catch (error) {
@@ -293,15 +490,60 @@ export class LangGraphAgent implements BaseAgent {
   }
 
   private async executeToolsNode(state: LangGraphAgentState): Promise<Partial<LangGraphAgentState>> {
-    const { toolCalls, streamingCallbacks } = state;
+    const { toolCalls, streamingCallbacks, messages } = state;
     const toolResults: Record<string, any> = {};
 
     this.logger.info('Executing tools', {
       toolCallsCount: toolCalls.length,
-      toolNames: toolCalls.map(tc => tc.toolName)
+      toolNames: toolCalls.map(tc => tc.toolName),
+      currentIterations: state.iterations,
+      maxIterations: state.maxIterations
     });
 
-    for (const toolCall of toolCalls) {
+    // Check if we've already executed these exact tool calls to prevent duplicates
+    // We need to check if there are corresponding toolResult blocks for these toolUse blocks
+    const toolCallSignatures = toolCalls.map(tc => tc.toolUseId);
+
+    // Look for tool results in user messages (these indicate executed tools)
+    const previouslyExecutedToolIds = messages
+      .filter(m => m.role === 'user')
+      .flatMap(m => Array.isArray(m.content) ? m.content : [])
+      .filter((c: any) => c.toolResult)
+      .map((c: any) => c.toolResult.toolUseId);
+
+    const newToolCalls = toolCalls.filter(tc => 
+      !previouslyExecutedToolIds.includes(tc.toolUseId)
+    );
+
+    if (newToolCalls.length === 0 && toolCalls.length > 0) {
+      this.logger.warn('All tool calls have already been executed, skipping redundant execution', {
+        attemptedToolCallIds: toolCallSignatures,
+        previouslyExecutedToolIds,
+        iterations: state.iterations
+      });
+      
+      // Emit Prometheus metric for redundant tool call attempts
+      const metricsEmitter = getPrometheusMetricsEmitter();
+      metricsEmitter.emitCounter('langgraph_agent_redundant_tool_calls_total', toolCalls.length, {
+        agent_type: 'langgraph',
+        iteration: state.iterations.toString()
+      });
+      
+      // CRITICAL: We must remove the last assistant message with unexecuted toolUse blocks
+      // Otherwise Bedrock will complain about toolUse without corresponding toolResult
+      // This happens when the model tries to call the same tool again
+      const cleanedMessages = state.messages.slice(0, -1);
+      
+      return {
+        messages: cleanedMessages,
+        toolCalls: [],
+        shouldContinue: false,
+        currentStep: "executeTools"
+      };
+    }
+
+    // Execute only new tool calls
+    for (const toolCall of newToolCalls) {
       const { toolName, toolUseId, input } = toolCall;
       
       this.logger.info('Tool execution started', {
@@ -340,22 +582,77 @@ export class LangGraphAgent implements BaseAgent {
       }
     }
 
+    const newIterations = state.iterations + 1;
+    const willContinue = newIterations < state.maxIterations && state.shouldContinue;
+
     this.logger.info('All tools executed', {
       toolResultsCount: Object.keys(toolResults).length,
       successfulTools: Object.entries(toolResults).filter(([, result]) => !result.error).length,
-      failedTools: Object.entries(toolResults).filter(([, result]) => result.error).length
+      failedTools: Object.entries(toolResults).filter(([, result]) => result.error).length,
+      previousIterations: state.iterations,
+      newIterations: newIterations,
+      maxIterations: state.maxIterations,
+      shouldContinue: state.shouldContinue,
+      willContinue: willContinue
     });
 
+    // Add tool results to the message history for the model to see
+    // The assistant message with toolUse blocks should already be in the messages array
+    // We just need to add the user message with toolResult blocks
+    
+    // Create user message with tool result blocks for all executed tools
+    // CRITICAL: Ensure content array is not empty
+    const toolResultContent = newToolCalls.map(tc => ({
+      toolResult: {
+        toolUseId: tc.toolUseId,
+        content: [{ text: JSON.stringify(toolResults[tc.toolUseId] || { error: 'No result found' }) }]
+      }
+    }));
+    
+    // Only create the message if we have tool results
+    if (toolResultContent.length === 0) {
+      this.logger.warn('No tool results to send back to model');
+      return {
+        toolCalls: [],
+        currentStep: "executeTools",
+        shouldContinue: false
+      };
+    }
+    
+    const toolResultMessage = {
+      role: 'user' as const,
+      content: toolResultContent
+    };
+
+    // Emit metric for iteration count
+    const metricsEmitter = getPrometheusMetricsEmitter();
+    metricsEmitter.emitHistogram('langgraph_agent_iterations_per_request', newIterations, {
+      agent_type: 'langgraph'
+    });
+
+    // Note: The assistant message with toolUse blocks is already in messages from callModelNode
+    // We only need to add the toolResult message
     return {
+      messages: [...messages, toolResultMessage],
       toolResults: { ...state.toolResults, ...toolResults },
       toolCalls: [], // Clear tool calls after execution
       currentStep: "executeTools",
-      iterations: state.iterations + 1 // Increment iterations after tool execution
+      iterations: newIterations, // Set the new iterations count
+      shouldContinue: true, // Keep this true to allow the graph to decide
+      lastToolExecution: Date.now() // Track when tools were last executed
     };
   }
 
   private async generateResponseNode(state: LangGraphAgentState): Promise<Partial<LangGraphAgentState>> {
-    const { streamingCallbacks } = state;
+    const { streamingCallbacks, messages, iterations } = state;
+    
+    this.logger.info('✅ generateResponseNode: Generating final response', {
+      iterations,
+      maxIterations: state.maxIterations,
+      messageCount: messages.length,
+      lastMessageRole: messages[messages.length - 1]?.role,
+      hasResponse: messages[messages.length - 1]?.role === 'assistant'
+    });
     
     streamingCallbacks?.onTurnComplete?.();
     
@@ -367,11 +664,27 @@ export class LangGraphAgent implements BaseAgent {
 
   // Helper methods that reuse existing infrastructure
   private prepareMessagesForBedrock(messages: any[]): any[] {
-    // Convert messages to Bedrock format (same as Jarvis)
-    return messages.map(msg => ({
-      role: msg.role || 'user',
-      content: [{ text: msg.content || '' }]
-    }));
+    // Convert messages to Bedrock format
+    // Keep all messages with valid content
+    return messages
+      .filter(msg => {
+        // Keep all messages that have content (including empty arrays for assistant)
+        // Bedrock needs to see the full conversation flow including tool use/result pairs
+        if (msg.content === undefined || msg.content === null) {
+          return false;
+        }
+        // Keep messages with empty content arrays (assistant messages with only tool calls)
+        if (Array.isArray(msg.content) && msg.content.length === 0 && msg.role === 'assistant') {
+          return false; // Skip truly empty assistant messages
+        }
+        return true;
+      })
+      .map(msg => ({
+        role: msg.role || 'user',
+        // If content is already an array (proper format), use it directly
+        // This preserves toolUse and toolResult blocks
+        content: Array.isArray(msg.content) ? msg.content : [{ text: msg.content || '' }]
+      }));
   }
 
   private prepareToolConfig(tools: any[]): any {
@@ -386,63 +699,105 @@ export class LangGraphAgent implements BaseAgent {
   }
 
   private async processStreamingResponse(response: any, callbacks?: StreamingCallbacks): Promise<any> {
-    // Process streaming response from Bedrock (similar to Jarvis)
+    // Process streaming response from Bedrock
+    // We need to preserve the complete message structure including content blocks
     const result = {
-      message: { role: 'assistant', content: '' },
-      toolCalls: []
+      message: { 
+        role: 'assistant', 
+        content: [],  // This will hold all content blocks (text and toolUse)
+        textContent: '' // Keep text separately for convenience
+      },
+      toolCalls: []  // Keep this for backward compatibility
     };
+
+    let currentTextBlock = '';
+    let currentToolUseBlock = null;
+    let hasAnyContent = false; // Track if we have any content at all
 
     if (response.stream) {
       for await (const chunk of response.stream) {
         if (chunk.contentBlockStart) {
           const start = chunk.contentBlockStart.start;
           if (start?.text) {
+            // Start a new text block
+            currentTextBlock = start.text;
             callbacks?.onTextStart?.(start.text);
-            result.message.content += start.text;
+            result.message.textContent += start.text;
+            hasAnyContent = true;
           } else if (start?.toolUse) {
+            // Start a new tool use block
+            currentToolUseBlock = {
+              toolUse: {
+                toolUseId: start.toolUse.toolUseId,
+                name: start.toolUse.name,
+                input: {}
+              },
+              inputBuffer: ''
+            };
+            
+            // Also track in toolCalls for backward compatibility
             const toolCall = {
               toolName: start.toolUse.name,
               toolUseId: start.toolUse.toolUseId,
               input: {}
             };
             result.toolCalls.push(toolCall);
+            hasAnyContent = true;
           }
         }
 
         if (chunk.contentBlockDelta) {
           const delta = chunk.contentBlockDelta.delta;
           if (delta?.text) {
+            currentTextBlock += delta.text;
             callbacks?.onTextDelta?.(delta.text);
-            result.message.content += delta.text;
-          } else if (delta?.toolUse && result.toolCalls.length > 0) {
+            result.message.textContent += delta.text;
+          } else if (delta?.toolUse && currentToolUseBlock && result.toolCalls.length > 0) {
             const lastToolCall = result.toolCalls[result.toolCalls.length - 1];
             try {
               // Handle streaming JSON input - may be incomplete
               if (delta.toolUse.input) {
-                // Accumulate input if it's incomplete
-                if (!lastToolCall.inputBuffer) {
-                  lastToolCall.inputBuffer = '';
-                }
-                lastToolCall.inputBuffer += delta.toolUse.input;
+                // Accumulate input
+                currentToolUseBlock.inputBuffer += delta.toolUse.input;
                 
                 // Try to parse the accumulated input
                 try {
-                  lastToolCall.input = JSON.parse(lastToolCall.inputBuffer);
+                  const parsedInput = JSON.parse(currentToolUseBlock.inputBuffer);
+                  currentToolUseBlock.toolUse.input = parsedInput;
+                  lastToolCall.input = parsedInput;
                 } catch (parseError) {
                   // JSON is incomplete, continue accumulating
-                  // Don't log this as it's expected during streaming
                 }
               }
             } catch (error) {
               this.logger.warn('Error processing tool use delta', { 
                 error: error.message,
-                input: delta.toolUse.input,
-                toolCall: lastToolCall
+                input: delta.toolUse.input
               });
             }
           }
         }
+
+        if (chunk.contentBlockStop) {
+          // Finalize the current block and add it to content
+          if (currentTextBlock) {
+            result.message.content.push({ text: currentTextBlock });
+            currentTextBlock = '';
+          } else if (currentToolUseBlock) {
+            // Remove the inputBuffer before adding to content
+            const { inputBuffer, ...toolUseBlock } = currentToolUseBlock;
+            result.message.content.push(toolUseBlock);
+            currentToolUseBlock = null;
+          }
+        }
       }
+    }
+    
+    // CRITICAL: If we have no content blocks at all (shouldn't happen but handle it),
+    // add an empty text block to ensure valid message format
+    if (result.message.content.length === 0 && !hasAnyContent) {
+      this.logger.warn('No content blocks received from Bedrock, adding empty text block');
+      result.message.content.push({ text: '' });
     }
 
     // Final cleanup - ensure all tool inputs are properly parsed
@@ -478,6 +833,58 @@ export class LangGraphAgent implements BaseAgent {
     return result;
   }
 
+  private parseToolCallsFromXML(content: string): any[] {
+    const toolCalls: any[] = [];
+    
+    try {
+      // Extract the function_calls block
+      const functionCallsMatch = content.match(/<function_calls>([\s\S]*?)<\/function_calls>/);
+      if (!functionCallsMatch) return toolCalls;
+      
+      const functionCallsXML = functionCallsMatch[1];
+      
+      // Find all invoke blocks
+      const invokeMatches = functionCallsXML.matchAll(/<invoke name="([^"]+)">([\s\S]*?)<\/invoke>/g);
+      
+      for (const match of invokeMatches) {
+        const toolName = match[1];
+        const paramsXML = match[2];
+        
+        // Parse parameters
+        const params: Record<string, any> = {};
+        const paramMatches = paramsXML.matchAll(/<parameter name="([^"]+)">([^<]*)<\/parameter>/g);
+        
+        for (const paramMatch of paramMatches) {
+          const paramName = paramMatch[1];
+          const paramValue = paramMatch[2];
+          params[paramName] = paramValue;
+        }
+        
+        // Generate a unique tool use ID
+        const toolUseId = `tooluse_${Math.random().toString(36).substring(2, 15)}`;
+        
+        toolCalls.push({
+          toolName: toolName,
+          toolUseId: toolUseId,
+          input: params
+        });
+        
+        this.logger.info('Parsed tool call from XML', {
+          toolName,
+          toolUseId,
+          input: params
+        });
+      }
+    } catch (error) {
+      this.logger.error('Failed to parse tool calls from XML', {
+        error: error instanceof Error ? error.message : String(error),
+        content: content.substring(0, 500)
+      });
+    }
+    
+    return toolCalls;
+  }
+
   private async executeToolCall(toolName: string, input: any): Promise<any> {
     // Execute tool call through MCP (same as Jarvis)
     // Tool names come in format: serverName__toolName
@@ -501,14 +908,14 @@ export class LangGraphAgent implements BaseAgent {
 
   async processMessageWithCallbacks(message: string, callbacks: StreamingCallbacks): Promise<void> {
     try {
-      // Create initial state
+      // Create initial state - ensure content is in array format
       const initialState: LangGraphAgentState = {
-        messages: [{ role: 'user', content: message }],
+        messages: [{ role: 'user', content: [{ text: message }] }],
         currentStep: "processInput",
         toolCalls: [],
         toolResults: {},
         iterations: 0,
-        maxIterations: 5,
+        maxIterations: LANGGRAPH_MAX_ITERATIONS,
         shouldContinue: true,
         streamingCallbacks: callbacks
       };
