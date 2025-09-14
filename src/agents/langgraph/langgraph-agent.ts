@@ -317,35 +317,24 @@ export class LangGraphAgent implements BaseAgent {
       // Log the actual messages being sent with full detail
       this.logger.info('LLM Request Messages (detailed)', {
         messageCount: bedrockMessages.length,
-        messages: bedrockMessages.map((msg, idx) => ({
-          index: idx,
-          role: msg.role,
-          contentLength: JSON.stringify(msg.content).length,
-          contentBlocks: msg.content.map((c: any) => ({
-            type: c.text !== undefined ? 'text' : 
-                  c.toolUse !== undefined ? 'toolUse' : 
-                  c.toolResult !== undefined ? 'toolResult' : 'unknown',
-            toolUseId: c.toolUse?.toolUseId || c.toolResult?.toolUseId,
-            hasContent: c.text?.length > 0 || c.toolUse !== undefined || c.toolResult !== undefined
-          }))
-        }))
+        messages: bedrockMessages
       });
       
-      this.logger.info('LLM Request to Bedrock', {
-        modelId: "us.anthropic.claude-sonnet-4-20250514-v1:0",
-        systemPromptLength: this.systemPrompt.length,
-        messageCount: bedrockMessages.length,
-        toolCount: toolConfig ? tools.length : 0,
-        toolsEnabled: !!toolConfig,
-        hasToolResultsInHistory,
-        iterations,
-        maxIterations: state.maxIterations,
-        atMaxIterations,
-        shouldDisableTools,
-        reason: shouldDisableTools ? 'max_iterations_reached' : 'tools_enabled',
-        maxTokens: 4096,
-        temperature: 0
-      });
+      // this.logger.info('LLM Request to Bedrock', {
+      //   modelId: "us.anthropic.claude-sonnet-4-20250514-v1:0",
+      //   systemPromptLength: this.systemPrompt.length,
+      //   messageCount: bedrockMessages.length,
+      //   toolCount: toolConfig ? tools.length : 0,
+      //   toolsEnabled: !!toolConfig,
+      //   hasToolResultsInHistory,
+      //   iterations,
+      //   maxIterations: state.maxIterations,
+      //   atMaxIterations,
+      //   shouldDisableTools,
+      //   reason: shouldDisableTools ? 'max_iterations_reached' : 'tools_enabled',
+      //   maxTokens: 4096,
+      //   temperature: 0
+      // });
 
       // Emit warning and metric if we're forcing a final response due to max iterations
       if (atMaxIterations) {
@@ -368,17 +357,7 @@ export class LangGraphAgent implements BaseAgent {
       
       this.logger.info('📤 LLM Response from Bedrock', {
         contentBlocksCount: processedResponse.message.content.length,
-        contentBlocks: processedResponse.message.content.map((block: any) => ({
-          type: block.text !== undefined ? 'text' : block.toolUse !== undefined ? 'toolUse' : 'unknown',
-          hasContent: block.text !== undefined ? block.text.length > 0 : block.toolUse !== undefined
-        })),
-        textContent: processedResponse.message.textContent?.length || 0,
-        textContentPreview: processedResponse.message.textContent?.substring(0, 100) || '',
-        toolCallsCount: processedResponse.toolCalls?.length || 0,
-        toolCallNames: processedResponse.toolCalls?.map(tc => tc.toolName) || [],
-        hasContent: processedResponse.message.content.length > 0,
-        hasText: processedResponse.message.textContent?.length > 0,
-        hasToolCalls: processedResponse.toolCalls?.length > 0
+        contentBlocks: processedResponse
       });
 
       // Check if the response contains XML tool calls in the text (fallback for when Bedrock doesn't recognize tools)
@@ -413,21 +392,31 @@ export class LangGraphAgent implements BaseAgent {
       let updatedMessages: any[];
       
       if (isFirstCallInTurn) {
-        // First call in this turn - always add the assistant message
-        updatedMessages = [...messages, assistantMessage];
+        // First call in this turn - add only the new assistant message
         this.logger.info('📝 First iteration: Adding initial assistant message', {
           previousMessageCount: messages.length,
           iterations,
           hasToolCalls: extractedToolCalls.length > 0
         });
+        
+        return {
+          messages: [assistantMessage], // Only return the new message, LangGraph will append it
+          toolCalls: extractedToolCalls,
+          currentStep: "callModel"
+        };
       } else if (extractedToolCalls.length === 0) {
         // Subsequent iteration with no tool calls - this is the final response
-        updatedMessages = [...messages, assistantMessage];
         this.logger.info('📝 Final response: Adding assistant message without tool calls', {
           previousMessageCount: messages.length,
           iterations,
           hasToolCalls: false
         });
+        
+        return {
+          messages: [assistantMessage], // Only return the new message, LangGraph will append it
+          toolCalls: extractedToolCalls,
+          currentStep: "callModel"
+        };
       } else {
         // Subsequent iteration with tool calls - DON'T add another assistant message
         // The previous assistant message with tool_use is already in the history
@@ -438,24 +427,13 @@ export class LangGraphAgent implements BaseAgent {
           hasToolCalls: true,
           reason: 'Previous assistant message with tool_use already exists'
         });
-        updatedMessages = messages; // Keep messages as-is
+        
+        return {
+          messages: [], // Don't add any new messages, just update tool calls
+          toolCalls: extractedToolCalls,
+          currentStep: "callModel"
+        };
       }
-
-      this.logger.info('📊 callModelNode: Returning state', {
-        newMessageCount: updatedMessages.length,
-        messagesChanged: updatedMessages.length !== messages.length,
-        addedMessage: updatedMessages.length > messages.length,
-        toolCallsCount: extractedToolCalls.length,
-        toolCallNames: extractedToolCalls.map(tc => tc.toolName),
-        iterations,
-        isFirstCallInTurn
-      });
-
-      return {
-        messages: updatedMessages,
-        toolCalls: extractedToolCalls,
-        currentStep: "callModel"
-      };
     } catch (error) {
       // Enhanced error logging to capture all error details
       this.logger.error('Error calling model', { 
@@ -529,13 +507,8 @@ export class LangGraphAgent implements BaseAgent {
         iteration: state.iterations.toString()
       });
       
-      // CRITICAL: We must remove the last assistant message with unexecuted toolUse blocks
-      // Otherwise Bedrock will complain about toolUse without corresponding toolResult
-      // This happens when the model tries to call the same tool again
-      const cleanedMessages = state.messages.slice(0, -1);
-      
       return {
-        messages: cleanedMessages,
+        messages: [], // Don't modify messages in this case, let the existing flow handle it
         toolCalls: [],
         shouldContinue: false,
         currentStep: "executeTools"
@@ -633,7 +606,7 @@ export class LangGraphAgent implements BaseAgent {
     // Note: The assistant message with toolUse blocks is already in messages from callModelNode
     // We only need to add the toolResult message
     return {
-      messages: [...messages, toolResultMessage],
+      messages: [toolResultMessage], // Only return the new message, LangGraph will append it
       toolResults: { ...state.toolResults, ...toolResults },
       toolCalls: [], // Clear tool calls after execution
       currentStep: "executeTools",
