@@ -255,24 +255,6 @@ export class LangGraphAgent implements BaseAgent {
         JSON.stringify(messages[messages.length - 1].content).substring(0, 100) : 'undefined'
     });
     
-    // Log the raw messages before processing
-    this.logger.info('Raw messages before Bedrock preparation', {
-      messages: messages.map((msg, idx) => ({
-        index: idx,
-        role: msg.role,
-        contentType: Array.isArray(msg.content) ? 'array' : typeof msg.content,
-        contentLength: Array.isArray(msg.content) ? msg.content.length : 
-                       typeof msg.content === 'string' ? msg.content.length : 0,
-        contentBlocks: Array.isArray(msg.content) ? 
-          msg.content.map((c: any) => ({
-            hasText: c.text !== undefined,
-            hasToolUse: c.toolUse !== undefined,
-            hasToolResult: c.toolResult !== undefined,
-            toolUseId: c.toolUse?.toolUseId || c.toolResult?.toolUseId
-          })) : null
-      }))
-    });
-    
     // Prepare messages for Bedrock (same as Jarvis)
     const bedrockMessages = this.prepareMessagesForBedrock(messages);
     
@@ -790,18 +772,6 @@ export class LangGraphAgent implements BaseAgent {
       // Clean up the buffer
       delete toolCall.inputBuffer;
     }
-
-    // Log the complete assembled response
-    this.logger.info('Complete LLM Response Assembled', {
-      messageRole: result.message.role,
-      messageContent: result.message.content,
-      toolCallsCount: result.toolCalls.length,
-      toolCalls: result.toolCalls.map(tc => ({
-        toolName: tc.toolName,
-        toolUseId: tc.toolUseId,
-        input: tc.input
-      }))
-    });
 
     return result;
   }
