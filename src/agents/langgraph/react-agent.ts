@@ -98,22 +98,17 @@ export class ReactAgent implements BaseAgent {
       this.logger.info(`Connected to ${name}, available tools: ${tools.length}`);
     }
 
-    // Load system prompt (use the same prompt as other agents)
+    // Load system prompt - now that MCP clients are connected, we can generate dynamic prompt
     if (customSystemPrompt) {
-      this.systemPrompt = customSystemPrompt;
+      this.systemPrompt = this.enhanceSystemPrompt(customSystemPrompt);
+      this.logger.info('Using enhanced custom system prompt with dynamic content');
     } else {
-      const promptPath = join(__dirname, '../../prompts/claudecode.md');
-      
-      try {
-        if (existsSync(promptPath)) {
-          this.systemPrompt = readFileSync(promptPath, 'utf-8');
-        } else {
-          this.systemPrompt = 'You are a helpful AI assistant.';
-        }
-      } catch (error) {
-        this.logger.warn('Failed to load system prompt, using default', { error });
-        this.systemPrompt = 'You are a helpful AI assistant.';
-      }
+      // Always use dynamic system prompt that describes actual MCP tools
+      this.systemPrompt = this.getDefaultSystemPrompt();
+      this.logger.info('Using dynamic system prompt with MCP tools', {
+        promptLength: this.systemPrompt.length,
+        connectedServers: Object.keys(this.mcpClients).length
+      });
     }
 
     this.buildStateGraph();
@@ -596,6 +591,191 @@ export class ReactAgent implements BaseAgent {
       currentStep: "generateResponse",
       shouldContinue: false
     };
+  }
+
+  private getDefaultSystemPrompt(): string {
+    // Load AI agent template and inject dynamic MCP tool information
+    const aiAgentPromptPath = join(__dirname, '../../prompts/claudecode.md');
+
+    if (!existsSync(aiAgentPromptPath)) {
+      this.logger.warn('claudecode.md not found, falling back to basic prompt');
+      return this.getFallbackSystemPrompt();
+    }
+
+    try {
+      let aiAgentPrompt = readFileSync(aiAgentPromptPath, 'utf-8');
+      return this.enhanceSystemPrompt(aiAgentPrompt);
+    } catch (error) {
+      const errorMessage = error instanceof Error ? error.message : String(error);
+      this.logger.error('Failed to load claudecode.md', { error: errorMessage });
+      return this.getFallbackSystemPrompt();
+    }
+  }
+
+  private enhanceSystemPrompt(prompt: string): string {
+    // Replace template placeholders with dynamic content
+    const toolDescriptions = this.generateToolDescriptions();
+    const toolValidationRules = this.getToolValidationRules();
+
+    return prompt
+      .replace('{{MCP_TOOL_DESCRIPTIONS}}', toolDescriptions)
+      .replace('{{TOOL_PARAMETER_VALIDATION_RULES}}', toolValidationRules);
+  }
+
+  private getFallbackSystemPrompt(): string {
+    // Fallback prompt if claudecode.md cannot be loaded
+    const toolDescriptions = this.generateToolDescriptions();
+    const openSearchContext = this.getOpenSearchClusterContext();
+
+    return `You are ReAct Agent, an AI assistant specialized in helping with software engineering tasks using the ReAct (Reasoning + Acting) pattern.
+
+You have access to the following tools through MCP (Model Context Protocol) servers:
+
+${toolDescriptions}
+
+${openSearchContext}
+
+Key behaviors:
+- Be concise and direct
+- Focus on the specific task at hand
+- Use available tools when appropriate
+- Provide clear, actionable responses
+- When asked about your tools, list ONLY the MCP tools shown above
+
+${this.getToolValidationRules()}`;
+  }
+
+  private getToolValidationRules(): string {
+    return `
+CRITICAL: Tool Parameter Validation and Self-Correction
+
+When using tools, you MUST follow this validation process:
+
+1. ANALYZE TOOL SCHEMA: Before calling any tool, carefully examine its description and parameter requirements
+   - Pay special attention to REQUIRED PARAMETERS listed in the tool description
+   - Review parameter types and constraints
+   - Ensure you understand what each parameter expects
+
+2. PARAMETER VALIDATION: Before making a tool call, verify:
+   - All required parameters are provided
+   - Parameter values are in the correct format
+   - No required parameters are null, undefined, or empty
+
+3. SELF-CORRECTION FLOW: If a tool call fails due to parameter validation:
+   - Immediately analyze the error message to identify missing or incorrect parameters
+   - Review the tool's parameter requirements again
+   - Ask the user for clarification if needed parameter values are not available in the context
+   - Retry the tool call with the correct parameters
+   - Do NOT make the same parameter mistake twice
+
+4. MULTI-TURN CORRECTION: For complex tool interactions:
+   - If you receive an error about missing parameters
+   - Stop and identify what information you need
+   - Either extract the required information from context or ask the user
+   - Retry with complete parameter set
+
+Example self-correction pattern:
+- Tool call fails: "Missing required parameter: path"
+- Response: "I need to provide the path parameter. Let me ask you for the file path or search for it in the context."
+- Retry with correct parameters
+
+Remember: Tool parameter validation errors should trigger immediate self-correction, not repeated failures.`;
+  }
+
+  private generateToolDescriptions(): string {
+    if (Object.keys(this.mcpClients).length === 0) {
+      return "No MCP tools currently available.";
+    }
+
+    const descriptions: string[] = [];
+
+    for (const [serverName, client] of Object.entries(this.mcpClients)) {
+      const serverTools = client.getTools();
+      if (serverTools.length > 0) {
+        descriptions.push(`## ${serverName} server tools:`);
+
+        for (const tool of serverTools) {
+          let toolDescription = `- **${tool.name}**: ${tool.description || 'No description available'}`;
+
+          if (tool.inputSchema.required && tool.inputSchema.required.length > 0) {
+            toolDescription += `\n  - Required parameters: ${tool.inputSchema.required.join(', ')}`;
+          }
+
+          descriptions.push(toolDescription);
+        }
+        descriptions.push(''); // Add blank line between servers
+      }
+    }
+
+    return descriptions.join('\n');
+  }
+
+  private getOpenSearchClusterContext(): string {
+    // Check if OpenSearch MCP server is connected
+    if (!this.mcpClients['opensearch-mcp-server']) {
+      return '';
+    }
+
+    try {
+      const clusters = this.getAvailableOpenSearchClusters();
+      if (clusters.length === 0) {
+        return '';
+      }
+
+      const clusterInfo = clusters.map(cluster => `- ${cluster}`).join('\n');
+
+      return `
+OPENSEARCH CLUSTER INFORMATION:
+You have access to OpenSearch clusters through the opensearch-mcp-server. Available clusters:
+${clusterInfo}
+
+IMPORTANT: When using OpenSearch tools, you MUST specify which cluster to use with the opensearch_cluster_name parameter.
+- If the user mentions a specific cluster name, use that cluster
+- If the user has previously specified a cluster in this conversation, continue using that cluster unless told otherwise
+- If no cluster is specified, ask the user which cluster they want to use
+- Remember the cluster selection throughout the conversation for consistency
+
+Example: If user says "search the osd-ops cluster", use opensearch_cluster_name: "osd-ops" for subsequent OpenSearch operations.`;
+    } catch (error) {
+      this.logger.debug('Could not get OpenSearch cluster context', { error });
+      return '';
+    }
+  }
+
+  private getAvailableOpenSearchClusters(): string[] {
+    try {
+      const fs = require('fs');
+      const yaml = require('js-yaml');
+      const path = require('path');
+
+      // Get config path from MCP server configuration
+      const opensearchConfig = this.mcpClients['opensearch-mcp-server']?.getConfig();
+      if (!opensearchConfig?.args) {
+        return [];
+      }
+
+      const configIndex = opensearchConfig.args.findIndex(arg => arg === '--config');
+      if (configIndex === -1 || configIndex + 1 >= opensearchConfig.args.length) {
+        return [];
+      }
+
+      const configPath = path.resolve(process.cwd(), opensearchConfig.args[configIndex + 1]);
+      if (!fs.existsSync(configPath)) {
+        return [];
+      }
+
+      const configContent = fs.readFileSync(configPath, 'utf8');
+      const config = yaml.load(configContent);
+
+      if (config?.clusters && typeof config.clusters === 'object') {
+        return Object.keys(config.clusters);
+      }
+
+      return [];
+    } catch (error) {
+      this.logger.debug('Error reading OpenSearch clusters', { error });
+      return [];
+    }
   }
 
   // Helper methods that reuse existing infrastructure

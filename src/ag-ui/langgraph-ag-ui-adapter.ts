@@ -210,6 +210,17 @@ export class LangGraphAGUIAdapter extends BaseAGUIAdapter {
               this.textMessageActive = true;
               this.isSecondTextMessage = true;
             }
+
+            // Update the message ID for content events if we're in the second message
+            if (this.isSecondTextMessage && this.currentMessageId) {
+              // Forward the event with the correct message ID
+              const updatedEvent = {
+                ...event,
+                messageId: this.currentMessageId
+              };
+              observer.next(updatedEvent);
+              return; // Don't forward the original event
+            }
           } else if (event.type === EventType.RUN_FINISHED) {
             // Before forwarding RUN_FINISHED, emit all our final events
             

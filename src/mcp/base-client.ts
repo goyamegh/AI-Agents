@@ -36,6 +36,10 @@ export abstract class BaseMCPClient {
     return this.tools;
   }
 
+  getConfig(): MCPServerConfig {
+    return this.config;
+  }
+
   async executeTool(name: string, input: any): Promise<any> {
     if (!this.client) {
       throw new Error('Client not connected');
@@ -238,22 +242,22 @@ WARNING: This failure has been recorded. After ${this.MAX_RETRY_ATTEMPTS} identi
       return input;
     }
 
-    // Auto-inject default cluster for OpenSearch tools
+    // Auto-inject cluster for OpenSearch tools
     const enhancedInput = { ...input };
-    
+
     try {
-      // Get default cluster from OpenSearch config
+      // Failsafe: Fall back to default cluster from OpenSearch config
       const defaultCluster = this.getDefaultOpenSearchCluster();
       if (defaultCluster) {
         enhancedInput.opensearch_cluster_name = defaultCluster;
-        this.logger.info(`Auto-injected OpenSearch cluster parameter`, { 
-          toolName, 
-          clusterName: defaultCluster 
+        this.logger.info(`Auto-injected default OpenSearch cluster parameter (failsafe)`, {
+          toolName,
+          clusterName: defaultCluster
         });
       }
     } catch (error) {
-      this.logger.warn(`Could not auto-inject OpenSearch cluster parameter`, { 
-        toolName, 
+      this.logger.warn(`Could not auto-inject OpenSearch cluster parameter`, {
+        toolName,
         error: error instanceof Error ? error.message : String(error)
       });
     }
@@ -261,36 +265,72 @@ WARNING: This failure has been recorded. After ${this.MAX_RETRY_ATTEMPTS} identi
     return enhancedInput;
   }
 
+
+  /**
+   * Get available OpenSearch clusters from configuration
+   */
+  private getAvailableOpenSearchClusters(): string[] {
+    try {
+      const configPath = this.getOpenSearchConfigPath();
+      if (!configPath) {
+        return [];
+      }
+
+      const fs = require('fs');
+      const yaml = require('js-yaml');
+
+      if (!fs.existsSync(configPath)) {
+        return [];
+      }
+
+      const configContent = fs.readFileSync(configPath, 'utf8');
+      const config = yaml.load(configContent);
+
+      if (config?.clusters && typeof config.clusters === 'object') {
+        return Object.keys(config.clusters);
+      }
+
+      return [];
+    } catch (error) {
+      this.logger.debug('Error reading OpenSearch clusters', { error });
+      return [];
+    }
+  }
+
+  /**
+   * Get OpenSearch config path from MCP server args
+   */
+  private getOpenSearchConfigPath(): string | null {
+    try {
+      const path = require('path');
+
+      // Extract config path from MCP server args
+      if (this.config.args) {
+        const configIndex = this.config.args.findIndex(arg => arg === '--config');
+        if (configIndex !== -1 && configIndex + 1 < this.config.args.length) {
+          const rawPath = this.config.args[configIndex + 1];
+          // Resolve relative paths from project root
+          return path.resolve(process.cwd(), rawPath);
+        }
+      }
+
+      return null;
+    } catch (error) {
+      this.logger.debug('Error getting OpenSearch config path', { error });
+      return null;
+    }
+  }
+
   /**
    * Get the default OpenSearch cluster name from configuration
    */
   private getDefaultOpenSearchCluster(): string | null {
     try {
-      const fs = require('fs');
-      const yaml = require('js-yaml');
-      const path = require('path');
-      
-      // Look for opensearch-config.yml in the project root
-      const configPath = path.join(process.cwd(), 'opensearch-config.yml');
-      
-      if (!fs.existsSync(configPath)) {
-        return null;
-      }
-
-      const configContent = fs.readFileSync(configPath, 'utf8');
-      const config = yaml.load(configContent);
-      
-      if (config?.clusters && typeof config.clusters === 'object') {
-        // Return the first cluster name as default
-        const clusterNames = Object.keys(config.clusters);
-        if (clusterNames.length > 0) {
-          return clusterNames[0];
-        }
-      }
-      
-      return null;
+      const clusters = this.getAvailableOpenSearchClusters();
+      // Return the first cluster name as default
+      return clusters.length > 0 ? clusters[0] : null;
     } catch (error) {
-      this.logger.debug(`Error reading OpenSearch config`, { error });
+      this.logger.debug(`Error getting default OpenSearch cluster`, { error });
       return null;
     }
   }

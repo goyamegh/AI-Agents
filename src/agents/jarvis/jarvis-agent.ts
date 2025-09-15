@@ -64,8 +64,8 @@ export class JarvisAgent implements BaseAgent {
 
     // Load system prompt - now that MCP clients are connected, we can generate dynamic prompt
     if (customSystemPrompt) {
-      this.systemPrompt = customSystemPrompt;
-      this.logger.info('Using custom system prompt');
+      this.systemPrompt = this.enhanceSystemPrompt(customSystemPrompt);
+      this.logger.info('Using enhanced custom system prompt with dynamic content');
     } else {
       // Always use dynamic system prompt that describes actual MCP tools
       this.systemPrompt = this.getDefaultSystemPrompt();
@@ -84,7 +84,7 @@ export class JarvisAgent implements BaseAgent {
   private getDefaultSystemPrompt(): string {
     // Load AI agent template and inject dynamic MCP tool information
     const aiAgentPromptPath = join(__dirname, '../../prompts/claudecode.md');
-    
+
     if (!existsSync(aiAgentPromptPath)) {
       this.logger.warn('claudecode.md not found, falling back to basic prompt');
       return this.getFallbackSystemPrompt();
@@ -92,21 +92,22 @@ export class JarvisAgent implements BaseAgent {
 
     try {
       let aiAgentPrompt = readFileSync(aiAgentPromptPath, 'utf-8');
-      
-      // Replace template placeholders with dynamic content
-      const toolDescriptions = this.generateToolDescriptions();
-      const toolValidationRules = this.getToolValidationRules();
-      
-      aiAgentPrompt = aiAgentPrompt
-        .replace('{{MCP_TOOL_DESCRIPTIONS}}', toolDescriptions)
-        .replace('{{TOOL_PARAMETER_VALIDATION_RULES}}', toolValidationRules);
-      
-      return aiAgentPrompt;
+      return this.enhanceSystemPrompt(aiAgentPrompt);
     } catch (error) {
       const errorMessage = error instanceof Error ? error.message : String(error);
       this.logger.error('Failed to load claudecode.md', { error: errorMessage });
       return this.getFallbackSystemPrompt();
     }
+  }
+
+  private enhanceSystemPrompt(prompt: string): string {
+    // Replace template placeholders with dynamic content
+    const toolDescriptions = this.generateToolDescriptions();
+    const toolValidationRules = this.getToolValidationRules();
+
+    return prompt
+      .replace('{{MCP_TOOL_DESCRIPTIONS}}', toolDescriptions)
+      .replace('{{TOOL_PARAMETER_VALIDATION_RULES}}', toolValidationRules);
   }
 
   private getFallbackSystemPrompt(): string {
