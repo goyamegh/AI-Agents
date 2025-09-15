@@ -13,7 +13,7 @@ import { v4 as uuidv4 } from 'uuid';
 import { getPrometheusMetricsEmitter } from '../../utils/metrics-emitter';
 
 // Configuration constants
-const LANGGRAPH_MAX_ITERATIONS = 10; // Maximum tool execution cycles before forcing final response
+const COACT_MAX_ITERATIONS = 10; // Maximum tool execution cycles before forcing final response
 
 // Todo-list based data structures
 export interface TodoItem {
@@ -170,6 +170,30 @@ export class CoActAgent implements BaseAgent {
           value: (x: string, y: string) => y || x,
           default: () => "processInput"
         },
+        todoList: {
+          value: (x: AgentTodoList, y: AgentTodoList) => y || x,
+          default: () => ({
+            todos: [],
+            currentIndex: 0,
+            executionOrder: [],
+            qualityThreshold: 0.8,
+            requiresFinalFormatting: false,
+            totalExecutionTime: 0,
+            metadata: {
+              userRequest: "",
+              planningTime: 0,
+              executionStartTime: 0
+            }
+          })
+        },
+        executionContext: {
+          value: (x: Map<string, any>, y: Map<string, any>) => y || x,
+          default: () => new Map<string, any>()
+        },
+        qualityScore: {
+          value: (x: number, y: number) => y,
+          default: () => 0
+        },
         toolCalls: {
           value: (x: any[], y: any[]) => [...x, ...y],
           default: () => []
@@ -184,18 +208,22 @@ export class CoActAgent implements BaseAgent {
         },
         maxIterations: {
           value: (x: number, y: number) => y || x,
-          default: () => LANGGRAPH_MAX_ITERATIONS
+          default: () => COACT_MAX_ITERATIONS
         },
         shouldContinue: {
           value: (x: boolean, y: boolean) => y,
           default: () => true
+        },
+        lastToolExecution: {
+          value: (x: number | undefined, y: number | undefined) => y || x,
+          default: () => undefined
         },
         streamingCallbacks: {
           value: (x: any, y: any) => y || x,
           default: () => undefined
         }
       }
-    });
+    } as any);
 
     // Add nodes (avoiding reserved names)
     this.graph.addNode("processInput", this.processInputNode.bind(this));
@@ -502,8 +530,8 @@ Remember: Output ONLY the JSON object, no additional text.`;
         
         // Emit Prometheus metric
         const metricsEmitter = getPrometheusMetricsEmitter();
-        metricsEmitter.emitCounter('langgraph_agent_max_iterations_reached_total', 1, {
-          agent_type: 'langgraph',
+        metricsEmitter.emitCounter('coact_agent_max_iterations_reached_total', 1, {
+          agent_type: 'coact',
           max_iterations: state.maxIterations.toString()
         });
       }
@@ -812,8 +840,8 @@ Remember: Output ONLY the JSON object, no additional text.`;
       
       // Emit Prometheus metric for redundant tool call attempts
       const metricsEmitter = getPrometheusMetricsEmitter();
-      metricsEmitter.emitCounter('langgraph_agent_redundant_tool_calls_total', toolCalls.length, {
-        agent_type: 'langgraph',
+      metricsEmitter.emitCounter('coact_agent_redundant_tool_calls_total', toolCalls.length, {
+        agent_type: 'coact',
         iteration: state.iterations.toString()
       });
       
@@ -909,8 +937,8 @@ Remember: Output ONLY the JSON object, no additional text.`;
 
     // Emit metric for iteration count
     const metricsEmitter = getPrometheusMetricsEmitter();
-    metricsEmitter.emitHistogram('langgraph_agent_iterations_per_request', newIterations, {
-      agent_type: 'langgraph'
+    metricsEmitter.emitHistogram('coact_agent_iterations_per_request', newIterations, {
+      agent_type: 'coact'
     });
 
     // Note: The assistant message with toolUse blocks is already in messages from callModelNode
@@ -1298,7 +1326,7 @@ ${JSON.stringify(results, null, 2)}`;
         executionContext: new Map(),
         qualityScore: 0,
         iterations: 0,
-        maxIterations: LANGGRAPH_MAX_ITERATIONS,
+        maxIterations: COACT_MAX_ITERATIONS,
         shouldContinue: true,
         toolCalls: [],
         toolResults: {},
@@ -1382,7 +1410,7 @@ ${JSON.stringify(results, null, 2)}`;
   }
 
   async startInteractiveMode(): Promise<void> {
-    console.log('🤖 LangGraph Agent Ready!');
+    console.log('🤖 CoAct Agent Ready!');
     console.log('📊 Using graph-based orchestration with MCP tools');
     console.log('💡 Type your message or "exit" to quit\n');
 

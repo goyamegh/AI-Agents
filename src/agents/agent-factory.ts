@@ -19,7 +19,7 @@ export class AgentFactory {
         return new ReactAgent();
       
       case 'coact':
-        const { CoActAgent } = require('./langgraph/langgraph-agent');
+        const { CoActAgent } = require('./langgraph/coact-agent');
         return new CoActAgent();
       
       // TODO: Phase 3 - Implement Strands agent  
