@@ -13,55 +13,25 @@ import { v4 as uuidv4 } from 'uuid';
 import { getPrometheusMetricsEmitter } from '../../utils/metrics-emitter';
 
 // Configuration constants
-const LANGGRAPH_MAX_ITERATIONS = 10; // Maximum tool execution cycles before forcing final response
+const STATEGRAPH_MAX_ITERATIONS = 10; // Maximum tool execution cycles before forcing final response
 
-// Todo-list based data structures
-export interface TodoItem {
-  id: string;
-  type: 'tool' | 'model' | 'verify' | 'format';
-  action: string;
-  toolName?: string;
-  toolParams?: any;
-  modelPrompt?: string;
-  dependencies: string[];
-  status: 'pending' | 'in_progress' | 'completed' | 'failed';
-  result?: any;
-  error?: string;
-  retryCount: number;
-  maxRetries: number;
-}
-
-export interface AgentTodoList {
-  todos: TodoItem[];
-  currentIndex: number;
-  executionOrder: string[];
-  qualityThreshold: number;
-  requiresFinalFormatting: boolean;
-  totalExecutionTime: number;
-  metadata: {
-    userRequest: string;
-    planningTime: number;
-    executionStartTime: number;
-  };
-}
-
-// LangGraph state interface
-export interface LangGraphAgentState {
+// StateGraph state interface
+export interface StateGraphAgentState {
   messages: any[];
   currentStep: string;
-  todoList: AgentTodoList;
-  executionContext: Map<string, any>;
-  qualityScore: number;
+  toolCalls: any[];
+  toolResults: Record<string, any>;
   iterations: number;
   maxIterations: number;
   shouldContinue: boolean;
   streamingCallbacks?: StreamingCallbacks;
+  lastToolExecution?: number; // Timestamp of last tool execution
 }
 
 /**
- * LangGraph Agent Implementation
+ * StateGraph Agent Implementation
  * 
- * This agent uses LangGraph for orchestration while reusing:
+ * This agent uses StateGraph for orchestration while reusing:
  * - AWS Bedrock ConverseStream API (same as Jarvis Agent)
  * - MCP tool infrastructure
  * - System prompts
@@ -69,13 +39,13 @@ export interface LangGraphAgentState {
  * 
  * The key difference is the graph-based state management and workflow orchestration
  */
-export class LangGraphAgent implements BaseAgent {
+export class StateGraphAgent implements BaseAgent {
   private bedrockClient: BedrockRuntimeClient;
   private mcpClients: Record<string, BaseMCPClient> = {};
   private conversationHistory: any[] = [];
   private systemPrompt: string = '';
   private logger: Logger;
-  private graph?: StateGraph<LangGraphAgentState>;
+  private graph?: StateGraph<StateGraphAgentState>;
   private compiledGraph?: any;
   private rl?: readline.Interface;
 
@@ -87,7 +57,7 @@ export class LangGraphAgent implements BaseAgent {
       region: region
     });
     
-    this.logger.info('LangGraph Agent initialized', {
+    this.logger.info('StateGraph Agent initialized', {
       region: region,
       hasAwsAccessKey: !!process.env.AWS_ACCESS_KEY_ID,
       hasAwsSecretKey: !!process.env.AWS_SECRET_ACCESS_KEY,
@@ -97,14 +67,14 @@ export class LangGraphAgent implements BaseAgent {
   }
 
   getAgentType(): string {
-    return 'langgraph-todo';
+    return 'stategraph';
   }
 
   async initialize(
     configs: Record<string, MCPServerConfig>, 
     customSystemPrompt?: string
   ): Promise<void> {
-    this.logger.info('Initializing LangGraph Agent', {
+    this.logger.info('Initializing StateGraph Agent', {
       serverCount: Object.keys(configs).length,
       servers: Object.keys(configs)
     });
@@ -146,17 +116,16 @@ export class LangGraphAgent implements BaseAgent {
       }
     }
 
-    // Build the LangGraph state graph
     this.buildStateGraph();
     
-    this.logger.info('LangGraph Agent initialization complete', {
+    this.logger.info('StateGraph Agent initialization complete', {
       totalTools: this.getAllTools().length
     });
   }
 
   private buildStateGraph(): void {
     // Create state graph with channels
-    this.graph = new StateGraph<LangGraphAgentState>({
+    this.graph = new StateGraph<StateGraphAgentState>({
       channels: {
         messages: {
           value: (x: any[], y: any[]) => [...x, ...y],
@@ -180,7 +149,7 @@ export class LangGraphAgent implements BaseAgent {
         },
         maxIterations: {
           value: (x: number, y: number) => y || x,
-          default: () => LANGGRAPH_MAX_ITERATIONS
+          default: () => STATEGRAPH_MAX_ITERATIONS
         },
         shouldContinue: {
           value: (x: boolean, y: boolean) => y,
@@ -206,7 +175,7 @@ export class LangGraphAgent implements BaseAgent {
     // Conditional edge from callModel
     this.graph.addConditionalEdges(
       "callModel" as any,
-      (state: LangGraphAgentState) => {
+      (state: StateGraphAgentState) => {
         // Log the decision for debugging
         this.logger.info('🔄 Graph Decision: callModel -> next node', {
           toolCallsCount: state.toolCalls.length,
@@ -228,7 +197,7 @@ export class LangGraphAgent implements BaseAgent {
     // Edge from executeTools back to callModel or to response
     this.graph.addConditionalEdges(
       "executeTools" as "__start__",
-      (state: LangGraphAgentState) => {
+      (state: StateGraphAgentState) => {
         const shouldContinue = state.iterations < state.maxIterations && state.shouldContinue;
         
         // Log the decision for debugging
@@ -259,147 +228,21 @@ export class LangGraphAgent implements BaseAgent {
     this.compiledGraph = this.graph.compile({ checkpointer });
   }
 
-  private async planningNode(state: LangGraphAgentState): Promise<Partial<LangGraphAgentState>> {
-    const { messages, streamingCallbacks } = state;
-    const startTime = Date.now();
-
-    this.logger.info('📋 Planning Node: Creating todo list', {
-      messageCount: messages.length,
-      userRequest: messages[0]?.content?.[0]?.text
+  private async processInputNode(state: StateGraphAgentState): Promise<Partial<StateGraphAgentState>> {
+    // Process input and prepare for model call
+    this.logger.info('Processing input', {
+      messageCount: state.messages.length,
+      iterations: state.iterations,
+      maxIterations: state.maxIterations
     });
-
-    // Load planning prompt from file
-    let planningPromptTemplate = '';
-    try {
-      const promptPath = join(__dirname, '../../prompts/planning-prompt.md');
-      if (existsSync(promptPath)) {
-        planningPromptTemplate = readFileSync(promptPath, 'utf-8');
-      } else {
-        this.logger.warn('Planning prompt file not found, using fallback');
-        planningPromptTemplate = 'Create a JSON todo list for the user request.';
-      }
-    } catch (error) {
-      this.logger.error('Failed to load planning prompt', { error });
-    }
-
-    // Build the complete prompt with user request and available tools
-    const userRequest = messages[0]?.content?.[0]?.text || '';
-    const availableTools = this.getAllTools().map(t => ({
-      name: t.toolSpec.name,
-      description: t.toolSpec.description
-    }));
-
-    const planningPrompt = `${planningPromptTemplate}
-
-User Request: ${userRequest}
-
-Available Tools:
-${JSON.stringify(availableTools, null, 2)}
-
-Remember: Output ONLY the JSON object, no additional text.`;
-
-    try {
-      // Call model to generate plan
-      const command = new ConverseStreamCommand({
-        modelId: "us.anthropic.claude-sonnet-4-20250514-v1:0",
-        messages: [{ role: 'user', content: [{ text: planningPrompt }] }],
-        system: [{ text: "You are a planning assistant. Output only valid JSON." }],
-        inferenceConfig: {
-          maxTokens: 4096,
-          temperature: 0,
-        }
-      });
-
-      const response = await this.bedrockClient.send(command);
-      const planResponse = await this.processStreamingResponse(response, streamingCallbacks);
-
-      // Parse the JSON plan
-      const planText = planResponse.message.textContent;
-      const jsonMatch = planText.match(/\{[\s\S]*\}/);
-
-      if (!jsonMatch) {
-        throw new Error('No JSON found in planning response');
-      }
-
-      const planJson = JSON.parse(jsonMatch[0]);
-
-      // Create todo list with proper defaults
-      const todoList: AgentTodoList = {
-        todos: (planJson.todos || []).map((t: any) => ({
-          id: t.id || uuidv4(),
-          type: t.type || 'tool',
-          action: t.action || 'Unnamed action',
-          toolName: t.toolName,
-          toolParams: t.toolParams || {},
-          modelPrompt: t.modelPrompt,
-          dependencies: t.dependencies || [],
-          status: 'pending',
-          retryCount: 0,
-          maxRetries: 3
-        })),
-        currentIndex: 0,
-        executionOrder: this.resolveDependencyOrder(planJson.todos || []),
-        qualityThreshold: planJson.qualityThreshold || 0.8,
-        requiresFinalFormatting: planJson.requiresFinalFormatting || false,
-        totalExecutionTime: 0,
-        metadata: {
-          userRequest: userRequest,
-          planningTime: Date.now() - startTime,
-          executionStartTime: 0
-        }
-      };
-
-      // Initialize execution context
-      const executionContext = new Map<string, any>();
-
-      this.logger.info('📋 Planning complete', {
-        todoCount: todoList.todos.length,
-        executionOrder: todoList.executionOrder,
-        requiresFormatting: todoList.requiresFinalFormatting,
-        planningTime: todoList.metadata.planningTime
-      });
-
-      return {
-        todoList,
-        executionContext,
-        currentStep: "planning"
-      };
-    } catch (error) {
-      this.logger.error('Planning failed', { error });
-      streamingCallbacks?.onError?.('Failed to create execution plan');
-      return {
-        shouldContinue: false,
-        currentStep: "planning"
-      };
-    }
-  }
-
-  private resolveDependencyOrder(todos: any[]): string[] {
-    // Simple topological sort for dependency resolution
-    const visited = new Set<string>();
-    const order: string[] = [];
-
-    const visit = (id: string) => {
-      if (visited.has(id)) return;
-      visited.add(id);
-
-      const todo = todos.find(t => t.id === id);
-      if (todo?.dependencies) {
-        for (const dep of todo.dependencies) {
-          visit(dep);
-        }
-      }
-      order.push(id);
+    
+    return {
+      currentStep: "processInput"
+      // Don't increment iterations here - only increment after tool execution
     };
-
-    for (const todo of todos) {
-      visit(todo.id || uuidv4());
-    }
-
-    return order;
   }
 
-  private async callModelNode(state: LangGraphAgentState): Promise<Partial<LangGraphAgentState>> {
+  private async callModelNode(state: StateGraphAgentState): Promise<Partial<StateGraphAgentState>> {
     const { messages, streamingCallbacks, iterations, toolResults } = state;
     
     this.logger.info('📥 callModelNode: Starting', {
@@ -457,22 +300,6 @@ Remember: Output ONLY the JSON object, no additional text.`;
         messageCount: bedrockMessages.length,
         messages: bedrockMessages
       });
-      
-      // this.logger.info('LLM Request to Bedrock', {
-      //   modelId: "us.anthropic.claude-sonnet-4-20250514-v1:0",
-      //   systemPromptLength: this.systemPrompt.length,
-      //   messageCount: bedrockMessages.length,
-      //   toolCount: toolConfig ? tools.length : 0,
-      //   toolsEnabled: !!toolConfig,
-      //   hasToolResultsInHistory,
-      //   iterations,
-      //   maxIterations: state.maxIterations,
-      //   atMaxIterations,
-      //   shouldDisableTools,
-      //   reason: shouldDisableTools ? 'max_iterations_reached' : 'tools_enabled',
-      //   maxTokens: 4096,
-      //   temperature: 0
-      // });
 
       // Emit warning and metric if we're forcing a final response due to max iterations
       if (atMaxIterations) {
@@ -484,8 +311,8 @@ Remember: Output ONLY the JSON object, no additional text.`;
         
         // Emit Prometheus metric
         const metricsEmitter = getPrometheusMetricsEmitter();
-        metricsEmitter.emitCounter('langgraph_agent_max_iterations_reached_total', 1, {
-          agent_type: 'langgraph',
+        metricsEmitter.emitCounter('stategraph_agent_max_iterations_reached_total', 1, {
+          agent_type: 'stategraph',
           max_iterations: state.maxIterations.toString()
         });
       }
@@ -527,8 +354,6 @@ Remember: Output ONLY the JSON object, no additional text.`;
       
       const isFirstCallInTurn = iterations === 0;
       
-      let updatedMessages: any[];
-      
       if (isFirstCallInTurn) {
         // First call in this turn - add only the new assistant message
         this.logger.info('📝 First iteration: Adding initial assistant message', {
@@ -538,7 +363,7 @@ Remember: Output ONLY the JSON object, no additional text.`;
         });
         
         return {
-          messages: [assistantMessage], // Only return the new message, LangGraph will append it
+          messages: [assistantMessage], // Only return the new message, StateGraph will append it
           toolCalls: extractedToolCalls,
           currentStep: "callModel"
         };
@@ -551,7 +376,7 @@ Remember: Output ONLY the JSON object, no additional text.`;
         });
         
         return {
-          messages: [assistantMessage], // Only return the new message, LangGraph will append it
+          messages: [assistantMessage], // Only return the new message, StateGraph will append it
           toolCalls: extractedToolCalls,
           currentStep: "callModel"
         };
@@ -605,161 +430,7 @@ Remember: Output ONLY the JSON object, no additional text.`;
     }
   }
 
-  private async executionNode(state: LangGraphAgentState): Promise<Partial<LangGraphAgentState>> {
-    const { todoList, executionContext, streamingCallbacks } = state;
-    const startTime = Date.now();
-
-    this.logger.info('🚀 Execution Node: Processing todos', {
-      todoCount: todoList.todos.length,
-      executionOrder: todoList.executionOrder
-    });
-
-    todoList.metadata.executionStartTime = startTime;
-
-    // Execute todos in dependency order
-    for (const todoId of todoList.executionOrder) {
-      const todo = todoList.todos.find(t => t.id === todoId);
-      if (!todo) continue;
-
-      // Check dependencies
-      const dependenciesMet = todo.dependencies.every(depId => {
-        const depTodo = todoList.todos.find(t => t.id === depId);
-        return depTodo?.status === 'completed';
-      });
-
-      if (!dependenciesMet) {
-        this.logger.warn('Dependencies not met for todo', {
-          todoId: todo.id,
-          dependencies: todo.dependencies
-        });
-        todo.status = 'failed';
-        todo.error = 'Dependencies not met';
-        continue;
-      }
-
-      // Execute todo based on type
-      this.logger.info(`Executing todo: ${todo.action}`, {
-        type: todo.type,
-        id: todo.id
-      });
-
-      todo.status = 'in_progress';
-
-      try {
-        let result: any;
-
-        switch (todo.type) {
-          case 'tool':
-            // Execute MCP tool
-            if (!todo.toolName) {
-              throw new Error('Tool name required for tool type');
-            }
-            streamingCallbacks?.onToolUseStart?.(todo.toolName, todo.id, todo.toolParams);
-            result = await this.executeToolCall(todo.toolName, todo.toolParams);
-            streamingCallbacks?.onToolResult?.(todo.toolName, todo.id, result);
-            break;
-
-          case 'model':
-            // Call LLM with context
-            if (!todo.modelPrompt) {
-              throw new Error('Model prompt required for model type');
-            }
-
-            // Build prompt with context from dependencies
-            let contextPrompt = todo.modelPrompt;
-            if (todo.dependencies.length > 0) {
-              const contextData = todo.dependencies.map(depId => ({
-                id: depId,
-                result: executionContext.get(depId)
-              }));
-              contextPrompt = `${todo.modelPrompt}\n\nContext from previous steps:\n${JSON.stringify(contextData, null, 2)}`;
-            }
-
-            const modelCommand = new ConverseStreamCommand({
-              modelId: "us.anthropic.claude-sonnet-4-20250514-v1:0",
-              messages: [{ role: 'user', content: [{ text: contextPrompt }] }],
-              system: [{ text: this.systemPrompt }],
-              inferenceConfig: {
-                maxTokens: 4096,
-                temperature: 0,
-              }
-            });
-
-            const modelResponse = await this.bedrockClient.send(modelCommand);
-            const processedResponse = await this.processStreamingResponse(modelResponse, streamingCallbacks);
-            result = processedResponse.message.textContent;
-            break;
-
-          case 'verify':
-            // Quality verification
-            result = this.verifyQuality(todo, executionContext);
-            break;
-
-          default:
-            throw new Error(`Unknown todo type: ${todo.type}`);
-        }
-
-        // Store result in context
-        executionContext.set(todo.id, result);
-        todo.result = result;
-        todo.status = 'completed';
-
-        this.logger.info(`Todo completed: ${todo.action}`, {
-          id: todo.id,
-          resultType: typeof result
-        });
-
-      } catch (error) {
-        const errorMessage = error instanceof Error ? error.message : String(error);
-        this.logger.error(`Todo failed: ${todo.action}`, {
-          id: todo.id,
-          error: errorMessage,
-          retryCount: todo.retryCount
-        });
-
-        todo.error = errorMessage;
-
-        // Retry logic
-        if (todo.retryCount < todo.maxRetries) {
-          todo.retryCount++;
-          todo.status = 'pending'; // Reset to retry
-          this.logger.info(`Retrying todo (${todo.retryCount}/${todo.maxRetries})`, {
-            id: todo.id
-          });
-          // TODO: Implement exponential backoff
-        } else {
-          todo.status = 'failed';
-          streamingCallbacks?.onError?.(`Failed: ${todo.action} - ${errorMessage}`);
-        }
-      }
-    }
-
-    todoList.totalExecutionTime = Date.now() - startTime;
-
-    this.logger.info('🚀 Execution complete', {
-      completedCount: todoList.todos.filter(t => t.status === 'completed').length,
-      failedCount: todoList.todos.filter(t => t.status === 'failed').length,
-      totalTime: todoList.totalExecutionTime
-    });
-
-    return {
-      todoList,
-      executionContext,
-      currentStep: "execution"
-    };
-  }
-
-  private verifyQuality(todo: TodoItem, context: Map<string, any>): any {
-    // Simple quality verification
-    // TODO: Implement proper quality checks
-    return {
-      verified: true,
-      score: 0.85,
-      details: 'Quality check passed'
-    };
-  }
-
-  private async executeToolsNode(state: LangGraphAgentState): Promise<Partial<LangGraphAgentState>> {
+  private async executeToolsNode(state: StateGraphAgentState): Promise<Partial<StateGraphAgentState>> {
     const { toolCalls, streamingCallbacks, messages } = state;
     const toolResults: Record<string, any> = {};
 
@@ -794,8 +465,8 @@ Remember: Output ONLY the JSON object, no additional text.`;
       
       // Emit Prometheus metric for redundant tool call attempts
       const metricsEmitter = getPrometheusMetricsEmitter();
-      metricsEmitter.emitCounter('langgraph_agent_redundant_tool_calls_total', toolCalls.length, {
-        agent_type: 'langgraph',
+      metricsEmitter.emitCounter('stategraph_agent_redundant_tool_calls_total', toolCalls.length, {
+        agent_type: 'stategraph',
         iteration: state.iterations.toString()
       });
       
@@ -891,14 +562,14 @@ Remember: Output ONLY the JSON object, no additional text.`;
 
     // Emit metric for iteration count
     const metricsEmitter = getPrometheusMetricsEmitter();
-    metricsEmitter.emitHistogram('langgraph_agent_iterations_per_request', newIterations, {
-      agent_type: 'langgraph'
+    metricsEmitter.emitHistogram('stategraph_agent_iterations_per_request', newIterations, {
+      agent_type: 'stategraph'
     });
 
     // Note: The assistant message with toolUse blocks is already in messages from callModelNode
     // We only need to add the toolResult message
     return {
-      messages: [toolResultMessage], // Only return the new message, LangGraph will append it
+      messages: [toolResultMessage], // Only return the new message, StateGraph will append it
       toolResults: { ...state.toolResults, ...toolResults },
       toolCalls: [], // Clear tool calls after execution
       currentStep: "executeTools",
@@ -908,118 +579,19 @@ Remember: Output ONLY the JSON object, no additional text.`;
     };
   }
 
-  private async verificationNode(state: LangGraphAgentState): Promise<Partial<LangGraphAgentState>> {
-    const { todoList, executionContext, streamingCallbacks } = state;
-
-    this.logger.info('✅ Verification Node: Assessing quality', {
-      completedTodos: todoList.todos.filter(t => t.status === 'completed').length,
-      totalTodos: todoList.todos.length
+  private async generateResponseNode(state: StateGraphAgentState): Promise<Partial<StateGraphAgentState>> {
+    const { streamingCallbacks, messages, iterations } = state;
+    
+    this.logger.info('✅ generateResponseNode: Generating final response', {
+      iterations,
+      maxIterations: state.maxIterations,
+      messageCount: messages.length,
+      lastMessageRole: messages[messages.length - 1]?.role,
+      hasResponse: messages[messages.length - 1]?.role === 'assistant'
     });
-
-    // Calculate quality metrics
-    const completeness = todoList.todos.filter(t => t.status === 'completed').length / todoList.todos.length;
-    const accuracy = todoList.todos.filter(t => !t.error).length / todoList.todos.length;
-
-    // Simple relevance, clarity, and actionability scores (can be enhanced)
-    const relevance = 0.9; // TODO: Implement proper relevance check
-    const clarity = 0.85; // TODO: Implement proper clarity check
-    const actionability = 0.8; // TODO: Implement proper actionability check
-
-    // Calculate weighted quality score
-    const qualityScore = (
-      completeness * 0.3 +
-      accuracy * 0.3 +
-      relevance * 0.2 +
-      clarity * 0.1 +
-      actionability * 0.1
-    );
-
-    this.logger.info('Quality assessment complete', {
-      completeness,
-      accuracy,
-      relevance,
-      clarity,
-      actionability,
-      qualityScore,
-      threshold: todoList.qualityThreshold
-    });
-
-    return {
-      qualityScore,
-      currentStep: "verification"
-    };
-  }
-
-  private async finalizationNode(state: LangGraphAgentState): Promise<Partial<LangGraphAgentState>> {
-    const { executionContext, streamingCallbacks, messages } = state;
-
-    this.logger.info('🎨 Finalization Node: Formatting response');
-
-    // Load formatting prompt from file
-    let formattingPromptTemplate = '';
-    try {
-      const promptPath = join(__dirname, '../../prompts/formatting-prompt.md');
-      if (existsSync(promptPath)) {
-        formattingPromptTemplate = readFileSync(promptPath, 'utf-8');
-      } else {
-        this.logger.warn('Formatting prompt file not found, using fallback');
-        formattingPromptTemplate = 'Format the execution results into a clear response.';
-      }
-    } catch (error) {
-      this.logger.error('Failed to load formatting prompt', { error });
-    }
-
-    // Create a summary of all execution results
-    const results = Array.from(executionContext.entries()).map(([id, result]) => ({
-      id,
-      result: typeof result === 'string' ? result : JSON.stringify(result, null, 2)
-    }));
-
-    const formattingPrompt = `${formattingPromptTemplate}
-
-User Request: ${messages[0]?.content?.[0]?.text || ''}
-
-Execution Results:
-${JSON.stringify(results, null, 2)}`;
-
-    try {
-      const command = new ConverseStreamCommand({
-        modelId: "us.anthropic.claude-sonnet-4-20250514-v1:0",
-        messages: [{ role: 'user', content: [{ text: formattingPrompt }] }],
-        system: [{ text: this.systemPrompt }],
-        inferenceConfig: {
-          maxTokens: 4096,
-          temperature: 0,
-        }
-      });
-
-      const response = await this.bedrockClient.send(command);
-      await this.processStreamingResponse(response, streamingCallbacks);
-
-      streamingCallbacks?.onTurnComplete?.();
-
-      return {
-        currentStep: "finalization",
-        shouldContinue: false
-      };
-    } catch (error) {
-      this.logger.error('Finalization failed', { error });
-      streamingCallbacks?.onError?.('Failed to format response');
-      return {
-        shouldContinue: false,
-        currentStep: "finalization"
-      };
-    }
-  }
-
-  private async generateResponseNode(state: LangGraphAgentState): Promise<Partial<LangGraphAgentState>> {
-    // This is now a legacy node for the old graph-based approach
-    // Keep for backward compatibility but log warning
-    this.logger.warn('⚠️ generateResponseNode called - this is legacy for graph-based approach');
-
-    const { streamingCallbacks } = state;
+    
     streamingCallbacks?.onTurnComplete?.();
-
+    
     return {
       currentStep: "generateResponse",
       shouldContinue: false
@@ -1260,45 +832,29 @@ ${JSON.stringify(results, null, 2)}`;
 
   async processMessageWithCallbacks(message: string, callbacks: StreamingCallbacks): Promise<void> {
     try {
-      // Create initial state for todo-list approach
-      const initialState: LangGraphAgentState = {
+      // Create initial state - ensure content is in array format
+      const initialState: StateGraphAgentState = {
         messages: [{ role: 'user', content: [{ text: message }] }],
-        currentStep: "planning",
-        todoList: {
-          todos: [],
-          currentIndex: 0,
-          executionOrder: [],
-          qualityThreshold: 0.8,
-          requiresFinalFormatting: false,
-          totalExecutionTime: 0,
-          metadata: {
-            userRequest: message,
-            planningTime: 0,
-            executionStartTime: 0
-          }
-        },
-        executionContext: new Map(),
-        qualityScore: 0,
+        currentStep: "processInput",
+        toolCalls: [],
+        toolResults: {},
         iterations: 0,
-        maxIterations: LANGGRAPH_MAX_ITERATIONS,
+        maxIterations: STATEGRAPH_MAX_ITERATIONS,
         shouldContinue: true,
         streamingCallbacks: callbacks
       };
 
       // Run the graph with thread configuration for memory persistence
-      const config = {
+      const config = { 
         configurable: { thread_id: "default_session" }
       };
       const finalState = await this.compiledGraph.invoke(initialState, config);
-
+      
       // Add to conversation history
       this.conversationHistory.push(
         { role: 'user', content: [{ text: message }] },
-        { role: 'assistant', content: [{ text: 'Response processed via todo-list execution' }] }
+        finalState.messages[finalState.messages.length - 1]
       );
-
-      // TODO: Implement long-term memory persistence here
-      // This would compress and store the execution context for future reference
 
     } catch (error) {
       const errorMessage = error instanceof Error ? error.message : String(error);
@@ -1362,7 +918,7 @@ ${JSON.stringify(results, null, 2)}`;
   }
 
   async startInteractiveMode(): Promise<void> {
-    console.log('🤖 LangGraph Agent Ready!');
+    console.log('🤖 StateGraph Agent Ready!');
     console.log('📊 Using graph-based orchestration with MCP tools');
     console.log('💡 Type your message or "exit" to quit\n');
 
@@ -1411,6 +967,6 @@ ${JSON.stringify(results, null, 2)}`;
       client.disconnect();
     }
     
-    this.logger.info('LangGraph Agent cleanup completed');
+    this.logger.info('StateGraph Agent cleanup completed');
   }
 }

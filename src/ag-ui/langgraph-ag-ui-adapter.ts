@@ -23,7 +23,7 @@ import {
   State
 } from '@ag-ui/core';
 import { BaseAGUIAdapter, BaseAGUIConfig } from './base-ag-ui-adapter';
-import { LangGraphAgent } from '../agents/langgraph/langgraph-agent';
+import { StateGraphAgent } from '../agents/langgraph/stategraph-agent';
 import { Logger } from '../utils/logger';
 import { AGUIAuditLogger } from '../utils/ag-ui-audit-logger';
 
@@ -38,15 +38,15 @@ export interface LangGraphState extends State {
 }
 
 export class LangGraphAGUIAdapter extends BaseAGUIAdapter {
-  private langGraphAgent: LangGraphAgent;
+  private stateGraphAgent: StateGraphAgent;
   private graphState: LangGraphState = {};
   private activeSteps = new Set<string>();
   private textMessageActive = false;
   private pendingStepEvents: BaseEvent[] = [];
   
-  constructor(agent: LangGraphAgent, config: BaseAGUIConfig = {}, logger?: Logger, auditLogger?: AGUIAuditLogger) {
+  constructor(agent: StateGraphAgent, config: BaseAGUIConfig = {}, logger?: Logger, auditLogger?: AGUIAuditLogger) {
     super(agent, config, logger, auditLogger);
-    this.langGraphAgent = agent;
+    this.stateGraphAgent = agent;
   }
 
   /**
