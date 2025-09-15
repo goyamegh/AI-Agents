@@ -19,6 +19,8 @@ import {
   StateDeltaEvent,
   StepStartedEvent,
   StepFinishedEvent,
+  TextMessageStartEvent,
+  TextMessageEndEvent,
   RunAgentInput,
   State
 } from '@ag-ui/core';
@@ -26,6 +28,7 @@ import { BaseAGUIAdapter, BaseAGUIConfig } from './base-ag-ui-adapter';
 import { ReactAgent } from '../agents/langgraph/react-agent';
 import { Logger } from '../utils/logger';
 import { AGUIAuditLogger } from '../utils/ag-ui-audit-logger';
+import { v4 as uuidv4 } from 'uuid';
 
 export interface LangGraphState extends State {
   currentNode?: string;
@@ -43,6 +46,11 @@ export class LangGraphAGUIAdapter extends BaseAGUIAdapter {
   private activeSteps = new Set<string>();
   private textMessageActive = false;
   private pendingStepEvents: BaseEvent[] = [];
+
+  // Dual text message state tracking
+  private currentMessageId?: string;
+  private hasToolCallsOccurred = false;
+  private isSecondTextMessage = false;
   
   constructor(agent: ReactAgent, config: BaseAGUIConfig = {}, logger?: Logger, auditLogger?: AGUIAuditLogger) {
     super(agent, config, logger, auditLogger);
@@ -70,10 +78,13 @@ export class LangGraphAGUIAdapter extends BaseAGUIAdapter {
 
       let runStartedEmitted = false;
       
-      // Clear active steps at start
+      // Clear active steps at start and reset dual text message state
       this.activeSteps.clear();
       this.textMessageActive = false;
       this.pendingStepEvents = [];
+      this.currentMessageId = undefined;
+      this.hasToolCallsOccurred = false;
+      this.isSecondTextMessage = false;
 
       // Subscribe to base events and enhance them
       const subscription = baseObservable.subscribe({
@@ -83,16 +94,31 @@ export class LangGraphAGUIAdapter extends BaseAGUIAdapter {
             this.textMessageActive = true;
           } else if (event.type === EventType.TEXT_MESSAGE_END) {
             this.textMessageActive = false;
-            
+
             // Forward the TEXT_MESSAGE_END event FIRST
             observer.next(event);
-            
-            // Then emit any pending step events AFTER TEXT_MESSAGE_END
-            for (const pendingEvent of this.pendingStepEvents) {
+
+            // Then emit any pending NON-TOOL step events AFTER TEXT_MESSAGE_END
+            // Tool events should flow through in real-time after text ends
+            const nonToolEvents = this.pendingStepEvents.filter(e =>
+              e.type !== EventType.TOOL_CALL_START &&
+              e.type !== EventType.TOOL_CALL_END &&
+              e.type !== EventType.TOOL_CALL_ARGS &&
+              e.type !== EventType.TOOL_CALL_RESULT
+            );
+
+            for (const pendingEvent of nonToolEvents) {
               observer.next(pendingEvent);
             }
-            this.pendingStepEvents = [];
-            
+
+            // Clear only the non-tool events - tool events should have flowed through already
+            this.pendingStepEvents = this.pendingStepEvents.filter(e =>
+              e.type === EventType.TOOL_CALL_START ||
+              e.type === EventType.TOOL_CALL_END ||
+              e.type === EventType.TOOL_CALL_ARGS ||
+              e.type === EventType.TOOL_CALL_RESULT
+            );
+
             return; // Don't forward TEXT_MESSAGE_END again
           }
           // Emit LangGraph-specific state after RUN_STARTED
@@ -128,13 +154,26 @@ export class LangGraphAGUIAdapter extends BaseAGUIAdapter {
           // Intercept and enhance specific events
           if (event.type === EventType.STEP_STARTED) {
             const stepEvent = event as StepStartedEvent;
-            
+
             // Track graph node transitions
             // Don't emit node transitions during text message - causes event ordering issues
             // if (stepEvent.stepName?.includes('_agent_processing')) {
             //   this.emitNodeTransition(observer, 'processInput');
             // }
           } else if (event.type === EventType.TOOL_CALL_START) {
+            // Handle the first tool call during active text message
+            if (this.textMessageActive && !this.hasToolCallsOccurred) {
+              // This is the first tool call - emit TEXT_MESSAGE_END for current message
+              observer.next({
+                type: EventType.TEXT_MESSAGE_END,
+                messageId: this.currentMessageId,
+                timestamp: Date.now()
+              } as TextMessageEndEvent);
+
+              this.textMessageActive = false;
+              this.hasToolCallsOccurred = true;
+            }
+
             // Track tool execution in graph state
             this.graphState.toolCallsPending = (this.graphState.toolCallsPending || 0) + 1;
             // Don't emit node transitions for tool events - they're handled during deferred processing
@@ -143,14 +182,34 @@ export class LangGraphAGUIAdapter extends BaseAGUIAdapter {
             // Update tool completion tracking
             this.graphState.toolCallsCompleted = (this.graphState.toolCallsCompleted || 0) + 1;
             this.graphState.toolCallsPending = Math.max(0, (this.graphState.toolCallsPending || 0) - 1);
-            
+
             // Don't emit node transitions for tool events - they're handled during deferred processing
             // if (this.graphState.iterations! < this.graphState.maxIterations!) {
             //   this.emitNodeTransition(observer, 'callModel');
             //   this.graphState.iterations = (this.graphState.iterations || 0) + 1;
-            // } else {
-            //   this.emitNodeTransition(observer, 'generateResponse');
+            // } else {\n            //   this.emitNodeTransition(observer, 'generateResponse');
             // }
+          } else if (event.type === EventType.TEXT_MESSAGE_START) {
+            // Track message ID for dual text message approach
+            this.currentMessageId = (event as TextMessageStartEvent).messageId;
+            this.hasToolCallsOccurred = false;
+            this.isSecondTextMessage = false;
+          } else if (event.type === EventType.TEXT_MESSAGE_CONTENT) {
+            // Check if this is text continuation after tool calls
+            if (this.hasToolCallsOccurred && !this.isSecondTextMessage && !this.textMessageActive) {
+              // Start second text message for continuation
+              const newMessageId = uuidv4();
+              observer.next({
+                type: EventType.TEXT_MESSAGE_START,
+                messageId: newMessageId,
+                role: 'assistant',
+                timestamp: Date.now()
+              } as TextMessageStartEvent);
+
+              this.currentMessageId = newMessageId;
+              this.textMessageActive = true;
+              this.isSecondTextMessage = true;
+            }
           } else if (event.type === EventType.RUN_FINISHED) {
             // Before forwarding RUN_FINISHED, emit all our final events
             
@@ -192,24 +251,13 @@ export class LangGraphAGUIAdapter extends BaseAGUIAdapter {
             } as StateSnapshotEvent);
           }
           
-          // Filter events based on text message state
-          if (this.textMessageActive && 
-              (event.type === EventType.STEP_STARTED || 
+          // Filter events based on text message state - only defer state/step events
+          if (this.textMessageActive &&
+              (event.type === EventType.STEP_STARTED ||
                event.type === EventType.STEP_FINISHED ||
                event.type === EventType.STATE_SNAPSHOT ||
                event.type === EventType.STATE_DELTA)) {
             // Don't forward these state events during text message - defer them until after TEXT_MESSAGE_END
-            this.pendingStepEvents.push(event);
-            return;
-          }
-          
-          // Defer tool call events during text message
-          if (this.textMessageActive && 
-              (event.type === EventType.TOOL_CALL_START ||
-               event.type === EventType.TOOL_CALL_END ||
-               event.type === EventType.TOOL_CALL_ARGS ||
-               event.type === EventType.TOOL_CALL_RESULT)) {
-            // Store tool events for later emission
             this.pendingStepEvents.push(event);
             return;
           }

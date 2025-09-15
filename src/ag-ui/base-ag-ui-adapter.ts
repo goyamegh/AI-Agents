@@ -7,6 +7,7 @@
  */
 
 import { v4 as uuidv4 } from 'uuid';
+import { readFileSync, existsSync } from 'fs';
 import { Observable } from 'rxjs';
 import {
   EventType,
@@ -70,10 +71,27 @@ export class BaseAGUIAdapter {
   async initialize(mcpConfigs: Record<string, MCPServerConfig> = {}): Promise<void> {
     const agentType = this.agent.getAgentType();
     this.logger.info(`Initializing ${agentType} AG UI Adapter`);
-    
-    // Initialize agent with MCP configs
-    await this.agent.initialize(mcpConfigs);
-    
+
+    // Check for custom system prompt file path from environment variable
+    let customSystemPrompt: string | undefined = undefined;
+    const systemPromptPath = process.env.SYSTEM_PROMPT;
+    if (systemPromptPath) {
+      try {
+        if (existsSync(systemPromptPath)) {
+          customSystemPrompt = readFileSync(systemPromptPath, 'utf-8');
+          this.logger.info('Using custom system prompt from file', { path: systemPromptPath });
+        } else {
+          this.logger.warn('System prompt file not found', { path: systemPromptPath });
+        }
+      } catch (error) {
+        const errorMessage = error instanceof Error ? error.message : String(error);
+        this.logger.error('Failed to load system prompt file', { path: systemPromptPath, error: errorMessage });
+      }
+    }
+
+    // Initialize agent with MCP configs and custom system prompt
+    await this.agent.initialize(mcpConfigs, customSystemPrompt);
+
     this.logger.info(`${agentType} AG UI Adapter initialized`);
   }
 

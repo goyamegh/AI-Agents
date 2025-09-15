@@ -1,44 +1,15 @@
 {
   "mcpServers": {
-    "filesystem": {
-      "type": "local",
-      "command": "npx",
-      "args": ["-y", "@modelcontextprotocol/server-filesystem", "/path/to/your/project"],
-      "env": {
-        "MCP_FILESYSTEM_ALLOW_WRITE": "true"
-      }
-    },
-    "github": {
-      "type": "local",
-      "command": "npx",
-      "args": ["-y", "@modelcontextprotocol/server-github"],
-      "env": {
-        "GITHUB_PERSONAL_ACCESS_TOKEN": "your_github_token_here"
-      }
-    },
-    "brave_search": {
-      "type": "local",
-      "command": "npx",
-      "args": ["-y", "@modelcontextprotocol/server-brave-search"],
-      "env": {
-        "BRAVE_API_KEY": "your_brave_api_key_here"
-      }
-    },
-    "sqlite": {
-      "type": "local",
-      "command": "npx",
-      "args": ["-y", "@modelcontextprotocol/server-sqlite", "--db-path", "./your-database.db"],
-      "env": {}
-    },
-    "puppeteer": {
-      "type": "local",
-      "command": "npx",
-      "args": ["-y", "@modelcontextprotocol/server-puppeteer"],
-      "env": {}
-    },
-    "remote_example": {
-      "type": "remote",
-      "url": "ws://localhost:8080/mcp",
+    "opensearch-mcp-server": {
+      "command": "uvx",
+      "args": [
+        "opensearch-mcp-server-py",
+        "--mode",
+        "multi",
+        "--config",
+        "./configuration/opensearch-config.yml"
+      ],
+      "disabled": false,
       "env": {}
     }
   }

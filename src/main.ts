@@ -13,6 +13,7 @@
  */
 
 import * as dotenv from 'dotenv';
+import { readFileSync, existsSync } from 'fs';
 import { AgentFactory } from './agents/agent-factory';
 import { Logger } from './utils/logger';
 import { ConfigLoader } from './config/config-loader';
@@ -43,8 +44,25 @@ async function main() {
 
   try {
     const agent = AgentFactory.createAgent(agentType);
-    
-    await agent.initialize(mcpConfigs, undefined);
+
+    // Check for custom system prompt file path from environment variable
+    let customSystemPrompt: string | undefined = undefined;
+    const systemPromptPath = process.env.SYSTEM_PROMPT;
+    if (systemPromptPath) {
+      try {
+        if (existsSync(systemPromptPath)) {
+          customSystemPrompt = readFileSync(systemPromptPath, 'utf-8');
+          logger.info('Using custom system prompt from file', { path: systemPromptPath });
+        } else {
+          logger.warn('System prompt file not found', { path: systemPromptPath });
+        }
+      } catch (error) {
+        const errorMessage = error instanceof Error ? error.message : String(error);
+        logger.error('Failed to load system prompt file', { path: systemPromptPath, error: errorMessage });
+      }
+    }
+
+    await agent.initialize(mcpConfigs, customSystemPrompt);
     await agent.startInteractiveMode();
   } catch (error) {
     const errorMessage = error instanceof Error ? error.message : String(error);
