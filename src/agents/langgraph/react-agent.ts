@@ -13,10 +13,10 @@ import { v4 as uuidv4 } from 'uuid';
 import { getPrometheusMetricsEmitter } from '../../utils/metrics-emitter';
 
 // Configuration constants
-const STATEGRAPH_MAX_ITERATIONS = 10; // Maximum tool execution cycles before forcing final response
+const REACT_MAX_ITERATIONS = 10; // Maximum tool execution cycles before forcing final response
 
 // StateGraph state interface
-export interface StateGraphAgentState {
+export interface ReactAgentState {
   messages: any[];
   currentStep: string;
   toolCalls: any[];
@@ -29,9 +29,9 @@ export interface StateGraphAgentState {
 }
 
 /**
- * StateGraph Agent Implementation
+ * ReAct Agent Implementation
  * 
- * This agent uses StateGraph for orchestration while reusing:
+ * This agent implements the ReAct (Reasoning + Acting) pattern using LangGraph's StateGraph:
  * - AWS Bedrock ConverseStream API (same as Jarvis Agent)
  * - MCP tool infrastructure
  * - System prompts
@@ -39,13 +39,13 @@ export interface StateGraphAgentState {
  * 
  * The key difference is the graph-based state management and workflow orchestration
  */
-export class StateGraphAgent implements BaseAgent {
+export class ReactAgent implements BaseAgent {
   private bedrockClient: BedrockRuntimeClient;
   private mcpClients: Record<string, BaseMCPClient> = {};
   private conversationHistory: any[] = [];
   private systemPrompt: string = '';
   private logger: Logger;
-  private graph?: StateGraph<StateGraphAgentState>;
+  private graph?: StateGraph<ReactAgentState>;
   private compiledGraph?: any;
   private rl?: readline.Interface;
 
@@ -57,7 +57,7 @@ export class StateGraphAgent implements BaseAgent {
       region: region
     });
     
-    this.logger.info('StateGraph Agent initialized', {
+    this.logger.info('ReAct Agent initialized', {
       region: region,
       hasAwsAccessKey: !!process.env.AWS_ACCESS_KEY_ID,
       hasAwsSecretKey: !!process.env.AWS_SECRET_ACCESS_KEY,
@@ -67,14 +67,14 @@ export class StateGraphAgent implements BaseAgent {
   }
 
   getAgentType(): string {
-    return 'stategraph';
+    return 'react';
   }
 
   async initialize(
     configs: Record<string, MCPServerConfig>, 
     customSystemPrompt?: string
   ): Promise<void> {
-    this.logger.info('Initializing StateGraph Agent', {
+    this.logger.info('Initializing ReAct Agent', {
       serverCount: Object.keys(configs).length,
       servers: Object.keys(configs)
     });
@@ -118,14 +118,14 @@ export class StateGraphAgent implements BaseAgent {
 
     this.buildStateGraph();
     
-    this.logger.info('StateGraph Agent initialization complete', {
+    this.logger.info('ReAct Agent initialization complete', {
       totalTools: this.getAllTools().length
     });
   }
 
   private buildStateGraph(): void {
     // Create state graph with channels
-    this.graph = new StateGraph<StateGraphAgentState>({
+    this.graph = new StateGraph<ReactAgentState>({
       channels: {
         messages: {
           value: (x: any[], y: any[]) => [...x, ...y],
@@ -149,7 +149,7 @@ export class StateGraphAgent implements BaseAgent {
         },
         maxIterations: {
           value: (x: number, y: number) => y || x,
-          default: () => STATEGRAPH_MAX_ITERATIONS
+          default: () => REACT_MAX_ITERATIONS
         },
         shouldContinue: {
           value: (x: boolean, y: boolean) => y,
@@ -175,17 +175,17 @@ export class StateGraphAgent implements BaseAgent {
     // Conditional edge from callModel
     this.graph.addConditionalEdges(
       "callModel" as any,
-      (state: StateGraphAgentState) => {
+      (state: ReactAgentState) => {
         // Log the decision for debugging
-        this.logger.info('🔄 Graph Decision: callModel -> next node', {
-          toolCallsCount: state.toolCalls.length,
-          hasToolCalls: state.toolCalls.length > 0,
-          iterations: state.iterations,
-          maxIterations: state.maxIterations,
-          messageCount: state.messages.length,
-          lastMessageRole: state.messages[state.messages.length - 1]?.role,
-          nextNode: state.toolCalls.length > 0 ? "executeTools" : "generateResponse"
-        });
+        // this.logger.info('🔄 Graph Decision: callModel -> next node', {
+        //   toolCallsCount: state.toolCalls.length,
+        //   hasToolCalls: state.toolCalls.length > 0,
+        //   iterations: state.iterations,
+        //   maxIterations: state.maxIterations,
+        //   messageCount: state.messages.length,
+        //   lastMessageRole: state.messages[state.messages.length - 1]?.role,
+        //   nextNode: state.toolCalls.length > 0 ? "executeTools" : "generateResponse"
+        // });
         
         if (state.toolCalls.length > 0) {
           return "executeTools";
@@ -197,7 +197,7 @@ export class StateGraphAgent implements BaseAgent {
     // Edge from executeTools back to callModel or to response
     this.graph.addConditionalEdges(
       "executeTools" as "__start__",
-      (state: StateGraphAgentState) => {
+      (state: ReactAgentState) => {
         const shouldContinue = state.iterations < state.maxIterations && state.shouldContinue;
         
         // Log the decision for debugging
@@ -228,7 +228,7 @@ export class StateGraphAgent implements BaseAgent {
     this.compiledGraph = this.graph.compile({ checkpointer });
   }
 
-  private async processInputNode(state: StateGraphAgentState): Promise<Partial<StateGraphAgentState>> {
+  private async processInputNode(state: ReactAgentState): Promise<Partial<ReactAgentState>> {
     // Process input and prepare for model call
     this.logger.info('Processing input', {
       messageCount: state.messages.length,
@@ -242,7 +242,7 @@ export class StateGraphAgent implements BaseAgent {
     };
   }
 
-  private async callModelNode(state: StateGraphAgentState): Promise<Partial<StateGraphAgentState>> {
+  private async callModelNode(state: ReactAgentState): Promise<Partial<ReactAgentState>> {
     const { messages, streamingCallbacks, iterations, toolResults } = state;
     
     this.logger.info('📥 callModelNode: Starting', {
@@ -311,8 +311,8 @@ export class StateGraphAgent implements BaseAgent {
         
         // Emit Prometheus metric
         const metricsEmitter = getPrometheusMetricsEmitter();
-        metricsEmitter.emitCounter('stategraph_agent_max_iterations_reached_total', 1, {
-          agent_type: 'stategraph',
+        metricsEmitter.emitCounter('react_agent_max_iterations_reached_total', 1, {
+          agent_type: 'react',
           max_iterations: state.maxIterations.toString()
         });
       }
@@ -356,11 +356,11 @@ export class StateGraphAgent implements BaseAgent {
       
       if (isFirstCallInTurn) {
         // First call in this turn - add only the new assistant message
-        this.logger.info('📝 First iteration: Adding initial assistant message', {
-          previousMessageCount: messages.length,
-          iterations,
-          hasToolCalls: extractedToolCalls.length > 0
-        });
+        // this.logger.info('📝 First iteration: Adding initial assistant message', {
+        //   previousMessageCount: messages.length,
+        //   iterations,
+        //   hasToolCalls: extractedToolCalls.length > 0
+        // });
         
         return {
           messages: [assistantMessage], // Only return the new message, StateGraph will append it
@@ -430,7 +430,7 @@ export class StateGraphAgent implements BaseAgent {
     }
   }
 
-  private async executeToolsNode(state: StateGraphAgentState): Promise<Partial<StateGraphAgentState>> {
+  private async executeToolsNode(state: ReactAgentState): Promise<Partial<ReactAgentState>> {
     const { toolCalls, streamingCallbacks, messages } = state;
     const toolResults: Record<string, any> = {};
 
@@ -465,8 +465,8 @@ export class StateGraphAgent implements BaseAgent {
       
       // Emit Prometheus metric for redundant tool call attempts
       const metricsEmitter = getPrometheusMetricsEmitter();
-      metricsEmitter.emitCounter('stategraph_agent_redundant_tool_calls_total', toolCalls.length, {
-        agent_type: 'stategraph',
+      metricsEmitter.emitCounter('react_agent_redundant_tool_calls_total', toolCalls.length, {
+        agent_type: 'react',
         iteration: state.iterations.toString()
       });
       
@@ -562,8 +562,8 @@ export class StateGraphAgent implements BaseAgent {
 
     // Emit metric for iteration count
     const metricsEmitter = getPrometheusMetricsEmitter();
-    metricsEmitter.emitHistogram('stategraph_agent_iterations_per_request', newIterations, {
-      agent_type: 'stategraph'
+    metricsEmitter.emitHistogram('react_agent_iterations_per_request', newIterations, {
+      agent_type: 'react'
     });
 
     // Note: The assistant message with toolUse blocks is already in messages from callModelNode
@@ -579,16 +579,16 @@ export class StateGraphAgent implements BaseAgent {
     };
   }
 
-  private async generateResponseNode(state: StateGraphAgentState): Promise<Partial<StateGraphAgentState>> {
+  private async generateResponseNode(state: ReactAgentState): Promise<Partial<ReactAgentState>> {
     const { streamingCallbacks, messages, iterations } = state;
     
-    this.logger.info('✅ generateResponseNode: Generating final response', {
-      iterations,
-      maxIterations: state.maxIterations,
-      messageCount: messages.length,
-      lastMessageRole: messages[messages.length - 1]?.role,
-      hasResponse: messages[messages.length - 1]?.role === 'assistant'
-    });
+    // this.logger.info('✅ generateResponseNode: Generating final response', {
+    //   iterations,
+    //   maxIterations: state.maxIterations,
+    //   messageCount: messages.length,
+    //   lastMessageRole: messages[messages.length - 1]?.role,
+    //   hasResponse: messages[messages.length - 1]?.role === 'assistant'
+    // });
     
     streamingCallbacks?.onTurnComplete?.();
     
@@ -833,13 +833,13 @@ export class StateGraphAgent implements BaseAgent {
   async processMessageWithCallbacks(message: string, callbacks: StreamingCallbacks): Promise<void> {
     try {
       // Create initial state - ensure content is in array format
-      const initialState: StateGraphAgentState = {
+      const initialState: ReactAgentState = {
         messages: [{ role: 'user', content: [{ text: message }] }],
         currentStep: "processInput",
         toolCalls: [],
         toolResults: {},
         iterations: 0,
-        maxIterations: STATEGRAPH_MAX_ITERATIONS,
+        maxIterations: REACT_MAX_ITERATIONS,
         shouldContinue: true,
         streamingCallbacks: callbacks
       };
@@ -918,8 +918,8 @@ export class StateGraphAgent implements BaseAgent {
   }
 
   async startInteractiveMode(): Promise<void> {
-    console.log('🤖 StateGraph Agent Ready!');
-    console.log('📊 Using graph-based orchestration with MCP tools');
+    console.log('🤖 ReAct Agent Ready!');
+    console.log('📊 Using ReAct pattern (Reasoning + Acting) with MCP tools');
     console.log('💡 Type your message or "exit" to quit\n');
 
     this.rl = readline.createInterface({
@@ -967,6 +967,6 @@ export class StateGraphAgent implements BaseAgent {
       client.disconnect();
     }
     
-    this.logger.info('StateGraph Agent cleanup completed');
+    this.logger.info('ReAct Agent cleanup completed');
   }
 }

@@ -158,11 +158,11 @@ export class BaseAGUIAdapter {
     this.conversationState = initialState;
     this.stateHistory.push(initialState);
 
-    this.emitAndAuditEvent({
-      type: EventType.STATE_SNAPSHOT,
-      snapshot: initialState,
-      timestamp: Date.now()
-    } as StateSnapshotEvent, observer, input.threadId, input.runId);
+    // this.emitAndAuditEvent({
+    //   type: EventType.STATE_SNAPSHOT,
+    //   snapshot: initialState,
+    //   timestamp: Date.now()
+    // } as StateSnapshotEvent, observer, input.threadId, input.runId);
 
     try {
       // Extract the last user message text from AG UI format
@@ -178,25 +178,6 @@ export class BaseAGUIAdapter {
       if (!messageText) {
         throw new Error('No text content found in user message');
       }
-
-      // Don't emit STEP_STARTED before TEXT_MESSAGE_START - it causes event ordering issues
-      // this.emitAndAuditEvent({
-      //   type: EventType.STEP_STARTED,
-      //   stepName: `${agentType}_agent_processing`,
-      //   timestamp: Date.now()
-      // } as StepStartedEvent, observer, input.threadId, input.runId);
-
-      // Emit thinking start for agent reasoning
-      // observer.next({
-      //   type: EventType.THINKING_START,
-      //   timestamp: Date.now()
-      // } as ThinkingStartEvent);
-
-      // observer.next({
-      //   type: EventType.THINKING_TEXT_MESSAGE_START,
-      //   title: 'Processing user request',
-      //   timestamp: Date.now()
-      // });
 
       // Emit text message start event
       const messageId = uuidv4();
@@ -361,12 +342,12 @@ export class BaseAGUIAdapter {
           } as ToolCallArgsEvent, observer, threadId, runId);
 
           // Also add a text message for visibility in the chat
-          this.emitAndAuditEvent({
-            type: EventType.TEXT_MESSAGE_CONTENT,
-            messageId,
-            delta: `\n\n🔧 Using tool: ${actualToolName}`,
-            timestamp: Date.now()
-          } as TextMessageContentEvent, observer, threadId, runId);
+          // this.emitAndAuditEvent({
+          //   type: EventType.TEXT_MESSAGE_CONTENT,
+          //   messageId,
+          //   delta: `\n\n🔧 Using tool: ${actualToolName}`,
+          //   timestamp: Date.now()
+          // } as TextMessageContentEvent, observer, threadId, runId);
         },
         onToolResult: (toolName: string, toolUseId: string, result: any) => {
           const actualToolName = toolName.split('__')[1] || toolName;
@@ -424,13 +405,13 @@ export class BaseAGUIAdapter {
           // } as StepFinishedEvent, observer, threadId, runId);
 
           // Also add a text message for visibility in the chat
-          const resultText = `\n\n✅ Tool ${actualToolName} result:\n${JSON.stringify(result, null, 2)}`;
-          this.emitAndAuditEvent({
-            type: EventType.TEXT_MESSAGE_CONTENT,
-            messageId,
-            delta: resultText,
-            timestamp: Date.now()
-          } as TextMessageContentEvent, observer, threadId, runId);
+          // const resultText = `\n\n✅ Tool ${actualToolName} result:\n${JSON.stringify(result, null, 2)}`;
+          // this.emitAndAuditEvent({
+          //   type: EventType.TEXT_MESSAGE_CONTENT,
+          //   messageId,
+          //   delta: resultText,
+          //   timestamp: Date.now()
+          // } as TextMessageContentEvent, observer, threadId, runId);
         },
         onToolError: (toolName: string, toolUseId: string, error: string) => {
           // Emit RUN_ERROR for tool failures

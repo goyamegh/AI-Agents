@@ -23,7 +23,7 @@ import { Logger } from './utils/logger';
 import { AGUIAuditLogger } from './utils/ag-ui-audit-logger';
 import { ConfigLoader } from './config/config-loader';
 import { HTTPServer } from './server/http-server';
-import { StateGraphAgent } from './agents/langgraph/stategraph-agent';
+import { ReactAgent } from './agents/langgraph/react-agent';
 
 // Load environment variables
 dotenv.config();
@@ -49,7 +49,7 @@ class BaseAGUIServer {
     const agent = AgentFactory.createAgent(agentType);
     
     // Use specialized adapter for LangGraph, base adapter for others
-    if (agentType === 'langgraph' && agent instanceof StateGraphAgent) {
+    if ((agentType === 'langgraph' || agentType === 'react') && agent instanceof ReactAgent) {
       this.adapter = new LangGraphAGUIAdapter(agent, config, this.logger, this.auditLogger);
       this.logger.info('Using LangGraphAGUIAdapter with enhanced graph tracking');
     } else {

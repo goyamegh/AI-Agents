@@ -45,8 +45,8 @@ export interface AgentTodoList {
   };
 }
 
-// LangGraph state interface
-export interface LangGraphAgentState {
+// CoAct Agent state interface
+export interface CoActAgentState {
   messages: any[];
   currentStep: string;
   todoList: AgentTodoList;
@@ -55,27 +55,31 @@ export interface LangGraphAgentState {
   iterations: number;
   maxIterations: number;
   shouldContinue: boolean;
+  toolCalls: any[];
+  toolResults: Record<string, any>;
+  lastToolExecution?: number;
   streamingCallbacks?: StreamingCallbacks;
 }
 
 /**
- * LangGraph Agent Implementation
- * 
- * This agent uses LangGraph for orchestration while reusing:
- * - AWS Bedrock ConverseStream API (same as Jarvis Agent)
+ * CoAct Agent Implementation
+ *
+ * This agent uses a CoAct (Collaborative Action) approach with LangGraph:
+ * - Creates a complete plan upfront using TodoList
+ * - Executes tasks in dependency order
+ * - Supports quality scoring and retry mechanisms
+ * - AWS Bedrock ConverseStream API integration
  * - MCP tool infrastructure
- * - System prompts
- * - Streaming callbacks
- * 
- * The key difference is the graph-based state management and workflow orchestration
+ *
+ * The key difference from ReAct is upfront planning with todo lists
  */
-export class LangGraphAgent implements BaseAgent {
+export class CoActAgent implements BaseAgent {
   private bedrockClient: BedrockRuntimeClient;
   private mcpClients: Record<string, BaseMCPClient> = {};
   private conversationHistory: any[] = [];
   private systemPrompt: string = '';
   private logger: Logger;
-  private graph?: StateGraph<LangGraphAgentState>;
+  private graph?: StateGraph<CoActAgentState>;
   private compiledGraph?: any;
   private rl?: readline.Interface;
 
@@ -87,7 +91,7 @@ export class LangGraphAgent implements BaseAgent {
       region: region
     });
     
-    this.logger.info('LangGraph Agent initialized', {
+    this.logger.info('CoAct Agent initialized', {
       region: region,
       hasAwsAccessKey: !!process.env.AWS_ACCESS_KEY_ID,
       hasAwsSecretKey: !!process.env.AWS_SECRET_ACCESS_KEY,
@@ -97,14 +101,14 @@ export class LangGraphAgent implements BaseAgent {
   }
 
   getAgentType(): string {
-    return 'langgraph-todo';
+    return 'coact';
   }
 
   async initialize(
     configs: Record<string, MCPServerConfig>, 
     customSystemPrompt?: string
   ): Promise<void> {
-    this.logger.info('Initializing LangGraph Agent', {
+    this.logger.info('Initializing CoAct Agent', {
       serverCount: Object.keys(configs).length,
       servers: Object.keys(configs)
     });
@@ -149,14 +153,14 @@ export class LangGraphAgent implements BaseAgent {
     // Build the LangGraph state graph
     this.buildStateGraph();
     
-    this.logger.info('LangGraph Agent initialization complete', {
+    this.logger.info('CoAct Agent initialization complete', {
       totalTools: this.getAllTools().length
     });
   }
 
   private buildStateGraph(): void {
     // Create state graph with channels
-    this.graph = new StateGraph<LangGraphAgentState>({
+    this.graph = new StateGraph<CoActAgentState>({
       channels: {
         messages: {
           value: (x: any[], y: any[]) => [...x, ...y],
@@ -206,17 +210,17 @@ export class LangGraphAgent implements BaseAgent {
     // Conditional edge from callModel
     this.graph.addConditionalEdges(
       "callModel" as any,
-      (state: LangGraphAgentState) => {
+      (state: CoActAgentState) => {
         // Log the decision for debugging
-        this.logger.info('🔄 Graph Decision: callModel -> next node', {
-          toolCallsCount: state.toolCalls.length,
-          hasToolCalls: state.toolCalls.length > 0,
-          iterations: state.iterations,
-          maxIterations: state.maxIterations,
-          messageCount: state.messages.length,
-          lastMessageRole: state.messages[state.messages.length - 1]?.role,
-          nextNode: state.toolCalls.length > 0 ? "executeTools" : "generateResponse"
-        });
+        // this.logger.info('🔄 Graph Decision: callModel -> next node', {
+        //   toolCallsCount: state.toolCalls.length,
+        //   hasToolCalls: state.toolCalls.length > 0,
+        //   iterations: state.iterations,
+        //   maxIterations: state.maxIterations,
+        //   messageCount: state.messages.length,
+        //   lastMessageRole: state.messages[state.messages.length - 1]?.role,
+        //   nextNode: state.toolCalls.length > 0 ? "executeTools" : "generateResponse"
+        // });
         
         if (state.toolCalls.length > 0) {
           return "executeTools";
@@ -228,7 +232,7 @@ export class LangGraphAgent implements BaseAgent {
     // Edge from executeTools back to callModel or to response
     this.graph.addConditionalEdges(
       "executeTools" as "__start__",
-      (state: LangGraphAgentState) => {
+      (state: CoActAgentState) => {
         const shouldContinue = state.iterations < state.maxIterations && state.shouldContinue;
         
         // Log the decision for debugging
@@ -259,7 +263,21 @@ export class LangGraphAgent implements BaseAgent {
     this.compiledGraph = this.graph.compile({ checkpointer });
   }
 
-  private async planningNode(state: LangGraphAgentState): Promise<Partial<LangGraphAgentState>> {
+  private async processInputNode(state: CoActAgentState): Promise<Partial<CoActAgentState>> {
+    // Process input and prepare for model call
+    this.logger.info('Processing input', {
+      messageCount: state.messages.length,
+      iterations: state.iterations,
+      maxIterations: state.maxIterations
+    });
+
+    return {
+      currentStep: "processInput"
+      // Don't increment iterations here - only increment after tool execution
+    };
+  }
+
+  private async planningNode(state: CoActAgentState): Promise<Partial<CoActAgentState>> {
     const { messages, streamingCallbacks } = state;
     const startTime = Date.now();
 
@@ -399,7 +417,7 @@ Remember: Output ONLY the JSON object, no additional text.`;
     return order;
   }
 
-  private async callModelNode(state: LangGraphAgentState): Promise<Partial<LangGraphAgentState>> {
+  private async callModelNode(state: CoActAgentState): Promise<Partial<CoActAgentState>> {
     const { messages, streamingCallbacks, iterations, toolResults } = state;
     
     this.logger.info('📥 callModelNode: Starting', {
@@ -531,11 +549,11 @@ Remember: Output ONLY the JSON object, no additional text.`;
       
       if (isFirstCallInTurn) {
         // First call in this turn - add only the new assistant message
-        this.logger.info('📝 First iteration: Adding initial assistant message', {
-          previousMessageCount: messages.length,
-          iterations,
-          hasToolCalls: extractedToolCalls.length > 0
-        });
+        // this.logger.info('📝 First iteration: Adding initial assistant message', {
+        //   previousMessageCount: messages.length,
+        //   iterations,
+        //   hasToolCalls: extractedToolCalls.length > 0
+        // });
         
         return {
           messages: [assistantMessage], // Only return the new message, LangGraph will append it
@@ -605,7 +623,7 @@ Remember: Output ONLY the JSON object, no additional text.`;
     }
   }
 
-  private async executionNode(state: LangGraphAgentState): Promise<Partial<LangGraphAgentState>> {
+  private async executionNode(state: CoActAgentState): Promise<Partial<CoActAgentState>> {
     const { todoList, executionContext, streamingCallbacks } = state;
     const startTime = Date.now();
 
@@ -759,7 +777,7 @@ Remember: Output ONLY the JSON object, no additional text.`;
     };
   }
 
-  private async executeToolsNode(state: LangGraphAgentState): Promise<Partial<LangGraphAgentState>> {
+  private async executeToolsNode(state: CoActAgentState): Promise<Partial<CoActAgentState>> {
     const { toolCalls, streamingCallbacks, messages } = state;
     const toolResults: Record<string, any> = {};
 
@@ -908,7 +926,7 @@ Remember: Output ONLY the JSON object, no additional text.`;
     };
   }
 
-  private async verificationNode(state: LangGraphAgentState): Promise<Partial<LangGraphAgentState>> {
+  private async verificationNode(state: CoActAgentState): Promise<Partial<CoActAgentState>> {
     const { todoList, executionContext, streamingCallbacks } = state;
 
     this.logger.info('✅ Verification Node: Assessing quality', {
@@ -950,7 +968,7 @@ Remember: Output ONLY the JSON object, no additional text.`;
     };
   }
 
-  private async finalizationNode(state: LangGraphAgentState): Promise<Partial<LangGraphAgentState>> {
+  private async finalizationNode(state: CoActAgentState): Promise<Partial<CoActAgentState>> {
     const { executionContext, streamingCallbacks, messages } = state;
 
     this.logger.info('🎨 Finalization Node: Formatting response');
@@ -1012,7 +1030,7 @@ ${JSON.stringify(results, null, 2)}`;
     }
   }
 
-  private async generateResponseNode(state: LangGraphAgentState): Promise<Partial<LangGraphAgentState>> {
+  private async generateResponseNode(state: CoActAgentState): Promise<Partial<CoActAgentState>> {
     // This is now a legacy node for the old graph-based approach
     // Keep for backward compatibility but log warning
     this.logger.warn('⚠️ generateResponseNode called - this is legacy for graph-based approach');
@@ -1261,7 +1279,7 @@ ${JSON.stringify(results, null, 2)}`;
   async processMessageWithCallbacks(message: string, callbacks: StreamingCallbacks): Promise<void> {
     try {
       // Create initial state for todo-list approach
-      const initialState: LangGraphAgentState = {
+      const initialState: CoActAgentState = {
         messages: [{ role: 'user', content: [{ text: message }] }],
         currentStep: "planning",
         todoList: {
@@ -1282,6 +1300,8 @@ ${JSON.stringify(results, null, 2)}`;
         iterations: 0,
         maxIterations: LANGGRAPH_MAX_ITERATIONS,
         shouldContinue: true,
+        toolCalls: [],
+        toolResults: {},
         streamingCallbacks: callbacks
       };
 
@@ -1411,6 +1431,6 @@ ${JSON.stringify(results, null, 2)}`;
       client.disconnect();
     }
     
-    this.logger.info('LangGraph Agent cleanup completed');
+    this.logger.info('CoAct Agent cleanup completed');
   }
 }

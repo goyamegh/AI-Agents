@@ -14,12 +14,13 @@ export class AgentFactory {
         return new JarvisAgent();
       
       case 'langgraph':
-        const { StateGraphAgent } = require('./langgraph/stategraph-agent');
-        return new StateGraphAgent();
+      case 'react':
+        const { ReactAgent } = require('./langgraph/react-agent');
+        return new ReactAgent();
       
-      case 'langgraph-todo':
-        const { LangGraphAgent } = require('./langgraph/langgraph-agent');
-        return new LangGraphAgent();
+      case 'coact':
+        const { CoActAgent } = require('./langgraph/langgraph-agent');
+        return new CoActAgent();
       
       // TODO: Phase 3 - Implement Strands agent  
       // case 'strands':
@@ -37,7 +38,7 @@ export class AgentFactory {
    * Get list of all available agent types
    */
   static getAvailableAgents(): string[] {
-    return ['jarvis', 'langgraph', 'langgraph-todo'];
+    return ['jarvis', 'langgraph', 'react', 'coact'];
   }
 
   /**
