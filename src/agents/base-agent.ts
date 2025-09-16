@@ -19,7 +19,7 @@ export interface BaseAgent {
   /**
    * Process a user message with streaming callbacks
    */
-  processMessageWithCallbacks(message: string, callbacks: StreamingCallbacks): Promise<void>;
+  processMessageWithCallbacks(message: string, callbacks: StreamingCallbacks, conversationHistory?: any[]): Promise<void>;
 
   /**
    * Send a message and process response (for CLI mode)

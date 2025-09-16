@@ -76,9 +76,9 @@ export interface CoActAgentState {
 export class CoActAgent implements BaseAgent {
   private bedrockClient: BedrockRuntimeClient;
   private mcpClients: Record<string, BaseMCPClient> = {};
-  private conversationHistory: any[] = [];
   private systemPrompt: string = '';
   private logger: Logger;
+  private cliConversationHistory: any[] = []; // For CLI mode only
   private graph?: StateGraph<CoActAgentState>;
   private compiledGraph?: any;
   private rl?: readline.Interface;
@@ -1304,11 +1304,25 @@ ${JSON.stringify(results, null, 2)}`;
     return await client.executeTool(actualToolName, input);
   }
 
-  async processMessageWithCallbacks(message: string, callbacks: StreamingCallbacks): Promise<void> {
+  async processMessageWithCallbacks(message: string, callbacks: StreamingCallbacks, conversationHistory?: any[]): Promise<void> {
     try {
+      // For server mode (with callbacks), use passed conversation history as-is
+      // For CLI mode (no callbacks), manage local history
+      let history: any[];
+
+      if (callbacks && conversationHistory) {
+        // Server mode: completely stateless, use client's history
+        history = conversationHistory;
+      } else {
+        // CLI mode: manage local history
+        const userMsg = { role: 'user', content: [{ text: message }] };
+        this.cliConversationHistory.push(userMsg);
+        history = this.cliConversationHistory;
+      }
+
       // Create initial state for todo-list approach
       const initialState: CoActAgentState = {
-        messages: [{ role: 'user', content: [{ text: message }] }],
+        messages: history,
         currentStep: "planning",
         todoList: {
           todos: [],
@@ -1339,11 +1353,12 @@ ${JSON.stringify(results, null, 2)}`;
       };
       const finalState = await this.compiledGraph.invoke(initialState, config);
 
-      // Add to conversation history
-      this.conversationHistory.push(
-        { role: 'user', content: [{ text: message }] },
-        { role: 'assistant', content: [{ text: 'Response processed via todo-list execution' }] }
-      );
+      // Update CLI history only if in CLI mode (no callbacks)
+      if (!callbacks) {
+        this.cliConversationHistory.push(
+          { role: 'assistant', content: [{ text: 'Response processed via todo-list execution' }] }
+        );
+      }
 
       // TODO: Implement long-term memory persistence here
       // This would compress and store the execution context for future reference

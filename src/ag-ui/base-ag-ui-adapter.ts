@@ -50,15 +50,6 @@ export class BaseAGUIAdapter {
   private agent: BaseAgent;
   private logger: Logger;
   private auditLogger?: AGUIAuditLogger;
-  private runningThreads = new Map<
-    string,
-    {
-      runId: string;
-      messages: Message[];
-      state: State;
-      tools: Tool[];
-    }
-  >();
 
   // State management for AG UI events
   private stateHistory: State[] = [];
@@ -245,7 +236,8 @@ export class BaseAGUIAdapter {
         messageId,
         observer,
         input.threadId,
-        input.runId
+        input.runId,
+        input.messages
       );
 
       // Emit thinking end after agent reasoning
@@ -341,7 +333,8 @@ export class BaseAGUIAdapter {
     messageId: string,
     observer: any,
     threadId: string,
-    runId: string
+    runId: string,
+    conversationHistory: any[]
   ): Promise<void> {
     const agentType = this.agent.getAgentType();
     try {
@@ -571,7 +564,7 @@ export class BaseAGUIAdapter {
       };
 
       // Use agent's callback-based processing
-      await this.agent.processMessageWithCallbacks(userMessage, callbacks);
+      await this.agent.processMessageWithCallbacks(userMessage, callbacks, conversationHistory);
     } catch (error) {
       const errorMessage =
         error instanceof Error ? error.message : String(error);
@@ -614,7 +607,6 @@ export class BaseAGUIAdapter {
    */
   cleanup(): void {
     this.agent.cleanup();
-    this.runningThreads.clear();
     const agentType = this.agent.getAgentType();
     this.logger.info(`${agentType} AG UI Adapter cleanup completed`);
   }

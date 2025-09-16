@@ -9,9 +9,9 @@ import { BaseAgent, StreamingCallbacks } from '../base-agent';
 export class JarvisAgent implements BaseAgent {
   private bedrockClient: BedrockRuntimeClient;
   private mcpClients: Record<string, BaseMCPClient> = {};
-  private conversationHistory: any[] = [];
   private systemPrompt: string = '';
   private logger: Logger;
+  private cliConversationHistory: any[] = []; // For CLI mode only
 
   constructor() {
     this.logger = new Logger();
@@ -287,33 +287,39 @@ Remember: Tool parameter validation errors should trigger immediate self-correct
     this.logger.info('Received user message', { message: userMessage });
     console.log('\n🧑 User:', userMessage);
 
-    // Add user message to history
+    // Add user message to CLI history
     const userMsg: any = {
       role: 'user',
       content: [{ text: userMessage }]
     };
-    this.conversationHistory.push(userMsg);
+    this.cliConversationHistory.push(userMsg);
 
-    await this.processConversationTurn();
+    await this.processConversationTurn(undefined, this.cliConversationHistory);
   }
 
   /**
    * Public method to process a user message with custom callbacks
    */
-  async processMessageWithCallbacks(userMessage: string, callbacks: StreamingCallbacks): Promise<void> {
+  async processMessageWithCallbacks(userMessage: string, callbacks: StreamingCallbacks, conversationHistory?: any[]): Promise<void> {
     this.logger.info('Processing message with callbacks', { message: userMessage });
 
-    // Add user message to history
-    const userMsg: any = {
-      role: 'user',
-      content: [{ text: userMessage }]
-    };
-    this.conversationHistory.push(userMsg);
-
-    await this.processConversationTurn(callbacks);
+    // For server mode (with callbacks), use passed conversation history as-is
+    // For CLI mode (no callbacks), manage local history
+    if (callbacks && conversationHistory) {
+      // Server mode: completely stateless, use client's history
+      await this.processConversationTurn(callbacks, conversationHistory);
+    } else {
+      // CLI mode: manage local history
+      const userMsg: any = {
+        role: 'user',
+        content: [{ text: userMessage }]
+      };
+      this.cliConversationHistory.push(userMsg);
+      await this.processConversationTurn(callbacks, this.cliConversationHistory);
+    }
   }
 
-  private async processConversationTurn(callbacks?: StreamingCallbacks): Promise<void> {
+  private async processConversationTurn(callbacks?: StreamingCallbacks, conversationHistory: any[] = []): Promise<void> {
     const tools = this.getAllTools();
     this.logger.debug('Available tools for request', { toolCount: tools.length });
 
@@ -321,7 +327,7 @@ Remember: Tool parameter validation errors should trigger immediate self-correct
       const command = new ConverseStreamCommand({
         modelId: 'us.anthropic.claude-sonnet-4-20250514-v1:0',
         system: [{ text: this.systemPrompt }],
-        messages: this.conversationHistory,
+        messages: conversationHistory,
         toolConfig: tools.length > 0 ? { tools: tools } : undefined,
         inferenceConfig: {
           maxTokens: 4000,
@@ -329,9 +335,9 @@ Remember: Tool parameter validation errors should trigger immediate self-correct
         }
       });
 
-      this.logger.debug('Sending request to Bedrock', { 
+      this.logger.debug('Sending request to Bedrock', {
         modelId: 'us.anthropic.claude-sonnet-4-20250514-v1:0',
-        messageCount: this.conversationHistory.length,
+        messageCount: conversationHistory.length,
         toolCount: tools.length
       });
 
@@ -576,9 +582,6 @@ Remember: Tool parameter validation errors should trigger immediate self-correct
         // Add tool uses to assistant message (but not tool results)
         assistantMessage.content.push(...toolUses);
 
-        // Add assistant message to history
-        this.conversationHistory.push(assistantMessage);
-
         // If there were tool results, create a follow-up conversation turn
         if (toolResults.length > 0) {
           // Add tool results as a user message to continue the conversation
@@ -586,20 +589,32 @@ Remember: Tool parameter validation errors should trigger immediate self-correct
             role: 'user',
             content: toolResults
           };
-          
-          this.conversationHistory.push(toolResultsMessage);
-          this.logger.info('Tool results added, continuing conversation', { 
-            toolResultCount: toolResults.length 
+
+          // Create updated conversation history with assistant message and tool results
+          const updatedHistory = [...conversationHistory, assistantMessage, toolResultsMessage];
+
+          // Update CLI history only if in CLI mode (no callbacks)
+          if (!callbacks) {
+            this.cliConversationHistory.push(assistantMessage, toolResultsMessage);
+          }
+
+          this.logger.info('Tool results added, continuing conversation', {
+            toolResultCount: toolResults.length
           });
 
           // Process another conversation turn with the tool results
-          await this.processConversationTurn(callbacks);
+          await this.processConversationTurn(callbacks, updatedHistory);
         } else {
+          // Update CLI history with final assistant message only if in CLI mode
+          if (!callbacks) {
+            this.cliConversationHistory.push(assistantMessage);
+          }
+
           this.logger.info('Response completed', {
-            conversationLength: this.conversationHistory.length,
+            conversationLength: conversationHistory.length,
             responseLength: currentText.length
           });
-          
+
           if (callbacks?.onTurnComplete) {
             callbacks.onTurnComplete();
           } else {

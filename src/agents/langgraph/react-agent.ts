@@ -42,9 +42,9 @@ export interface ReactAgentState {
 export class ReactAgent implements BaseAgent {
   private bedrockClient: BedrockRuntimeClient;
   private mcpClients: Record<string, BaseMCPClient> = {};
-  private conversationHistory: any[] = [];
   private systemPrompt: string = '';
   private logger: Logger;
+  private cliConversationHistory: any[] = []; // For CLI mode only
   private graph?: StateGraph<ReactAgentState>;
   private compiledGraph?: any;
   private rl?: readline.Interface;
@@ -1010,11 +1010,25 @@ Example: If user says "search the osd-ops cluster", use opensearch_cluster_name:
     return await client.executeTool(actualToolName, input);
   }
 
-  async processMessageWithCallbacks(message: string, callbacks: StreamingCallbacks): Promise<void> {
+  async processMessageWithCallbacks(message: string, callbacks: StreamingCallbacks, conversationHistory?: any[]): Promise<void> {
     try {
-      // Create initial state - ensure content is in array format
+      // For server mode (with callbacks), use passed conversation history as-is
+      // For CLI mode (no callbacks), manage local history
+      let history: any[];
+
+      if (callbacks && conversationHistory) {
+        // Server mode: completely stateless, use client's history
+        history = conversationHistory;
+      } else {
+        // CLI mode: manage local history
+        const userMsg = { role: 'user', content: [{ text: message }] };
+        this.cliConversationHistory.push(userMsg);
+        history = this.cliConversationHistory;
+      }
+
+      // Create initial state with conversation history
       const initialState: ReactAgentState = {
-        messages: [{ role: 'user', content: [{ text: message }] }],
+        messages: history,
         currentStep: "processInput",
         toolCalls: [],
         toolResults: {},
@@ -1025,16 +1039,18 @@ Example: If user says "search the osd-ops cluster", use opensearch_cluster_name:
       };
 
       // Run the graph with thread configuration for memory persistence
-      const config = { 
+      const config = {
         configurable: { thread_id: "default_session" }
       };
       const finalState = await this.compiledGraph.invoke(initialState, config);
-      
-      // Add to conversation history
-      this.conversationHistory.push(
-        { role: 'user', content: [{ text: message }] },
-        finalState.messages[finalState.messages.length - 1]
-      );
+
+      // Update CLI history only if in CLI mode (no callbacks)
+      if (!callbacks) {
+        // Add the final assistant response to CLI history
+        if (finalState.messages.length > this.cliConversationHistory.length) {
+          this.cliConversationHistory.push(finalState.messages[finalState.messages.length - 1]);
+        }
+      }
 
     } catch (error) {
       const errorMessage = error instanceof Error ? error.message : String(error);
