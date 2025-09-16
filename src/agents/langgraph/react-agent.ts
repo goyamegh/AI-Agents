@@ -11,6 +11,7 @@ import { BaseAgent, StreamingCallbacks } from '../base-agent';
 import readline from 'readline';
 import { v4 as uuidv4 } from 'uuid';
 import { getPrometheusMetricsEmitter } from '../../utils/metrics-emitter';
+import { truncateToolResult } from '../../utils/truncate-tool-result';
 
 // Configuration constants
 const REACT_MAX_ITERATIONS = 10; // Maximum tool execution cycles before forcing final response
@@ -134,8 +135,9 @@ export class ReactAgent implements BaseAgent {
           value: (x: string, y: string) => y || x,
           default: () => "processInput"
         },
+        // TODO: Test whether we need to accumulate tool calls or just replace
         toolCalls: {
-          value: (x: any[], y: any[]) => [...x, ...y],
+          value: (x: any[], y: any[]) => y,  // Replace instead of accumulate
           default: () => []
         },
         toolResults: {
@@ -581,12 +583,16 @@ export class ReactAgent implements BaseAgent {
     
     // Create user message with tool result blocks for all executed tools
     // CRITICAL: Ensure content array is not empty
-    const toolResultContent = newToolCalls.map(tc => ({
-      toolResult: {
-        toolUseId: tc.toolUseId,
-        content: [{ text: JSON.stringify(toolResults[tc.toolUseId] || { error: 'No result found' }) }]
-      }
-    }));
+    const toolResultContent = newToolCalls.map(tc => {
+      // Truncate tool result to prevent API input size errors
+      const truncatedResult = truncateToolResult(toolResults[tc.toolUseId] || { error: 'No result found' });
+      return {
+        toolResult: {
+          toolUseId: tc.toolUseId,
+          content: [{ text: truncatedResult }]
+        }
+      };
+    });
     
     // Only create the message if we have tool results
     if (toolResultContent.length === 0) {
@@ -821,7 +827,7 @@ Example: If user says "search the osd-ops cluster", use opensearch_cluster_name:
   private prepareMessagesForBedrock(messages: any[]): any[] {
     // Convert messages to Bedrock format
     // Keep all messages with valid content
-    return messages
+    const prepared = messages
       .filter(msg => {
         // Keep all messages that have content (including empty arrays for assistant)
         // Bedrock needs to see the full conversation flow including tool use/result pairs
@@ -840,6 +846,38 @@ Example: If user says "search the osd-ops cluster", use opensearch_cluster_name:
         // This preserves toolUse and toolResult blocks
         content: Array.isArray(msg.content) ? msg.content : [{ text: msg.content || '' }]
       }));
+
+    // Debug logging to catch toolUse/toolResult mismatch
+    let toolUseCount = 0;
+    let toolResultCount = 0;
+
+    prepared.forEach((msg, index) => {
+      if (msg.role === 'assistant' && Array.isArray(msg.content)) {
+        const msgToolUses = msg.content.filter((c: any) => c.toolUse).length;
+        toolUseCount += msgToolUses;
+        if (msgToolUses > 0) {
+          this.logger.info(`Message ${index} (assistant): ${msgToolUses} toolUse blocks`);
+        }
+      }
+      if (msg.role === 'user' && Array.isArray(msg.content)) {
+        const msgToolResults = msg.content.filter((c: any) => c.toolResult).length;
+        toolResultCount += msgToolResults;
+        if (msgToolResults > 0) {
+          this.logger.info(`Message ${index} (user): ${msgToolResults} toolResult blocks`);
+        }
+      }
+    });
+
+    if (toolUseCount !== toolResultCount) {
+      this.logger.warn(`⚠️ Tool use/result mismatch detected!`, {
+        toolUseCount,
+        toolResultCount,
+        messageCount: prepared.length,
+        lastMessage: prepared[prepared.length - 1]
+      });
+    }
+
+    return prepared;
   }
 
   private prepareToolConfig(tools: any[]): any {
