@@ -48,6 +48,25 @@ export abstract class BaseMCPClient {
     // Auto-inject OpenSearch cluster parameter if needed
     input = this.enhanceInputWithClusterConfig(name, input);
 
+    // Validate OpenSearch cluster name if provided
+    if (this.serverName === 'opensearch-mcp-server' && input?.opensearch_cluster_name) {
+      const availableClusters = this.getAvailableOpenSearchClusters();
+      if (availableClusters.length > 0 && !availableClusters.includes(input.opensearch_cluster_name)) {
+        const errorMessage = `INVALID OPENSEARCH CLUSTER NAME: "${input.opensearch_cluster_name}"
+
+📌 AVAILABLE OPENSEARCH CLUSTERS:
+${availableClusters.map(c => `  - "${c}"`).join('\n')}
+
+Please use one of the available cluster names listed above.`;
+
+        this.logger.error(`Invalid OpenSearch cluster name`, {
+          provided: input.opensearch_cluster_name,
+          available: availableClusters
+        });
+        throw new Error(errorMessage);
+      }
+    }
+
     this.logger.info(`Executing tool ${name} on ${this.serverName}`, { input });
     
     // Validate tool exists and get its schema
@@ -105,17 +124,26 @@ The system is preventing repeated identical failures to avoid infinite loops.`;
           missingParams.push(requiredParam);
         }
       }
-      
+
       if (missingParams.length > 0) {
         // Record this failure for circuit breaker
         this.recordToolFailure(name, inputHash, currentTime);
-        
+
+        // Special handling for OpenSearch cluster parameter
+        let clusterSuggestion = '';
+        if (this.serverName === 'opensearch-mcp-server' && missingParams.includes('opensearch_cluster_name')) {
+          const availableClusters = this.getAvailableOpenSearchClusters();
+          if (availableClusters.length > 0) {
+            clusterSuggestion = `\n\n📌 AVAILABLE OPENSEARCH CLUSTERS:\n${availableClusters.map(c => `  - "${c}"`).join('\n')}\n\nExample: opensearch_cluster_name: "${availableClusters[0]}"`;
+          }
+        }
+
         const errorMessage = `PARAMETER VALIDATION FAILED for tool "${name}":
 
 Missing required parameters: ${missingParams.join(', ')}
 
 Tool schema shows these are required: ${tool.inputSchema.required.join(', ')}
-You provided: ${Object.keys(input || {}).join(', ') || 'no parameters'}
+You provided: ${Object.keys(input || {}).join(', ') || 'no parameters'}${clusterSuggestion}
 
 SELF-CORRECTION NEEDED:
 1. Review the tool description for parameter requirements
@@ -286,6 +314,7 @@ WARNING: This failure has been recorded. After ${this.MAX_RETRY_ATTEMPTS} identi
       const configContent = fs.readFileSync(configPath, 'utf8');
       const config = yaml.load(configContent);
 
+
       if (config?.clusters && typeof config.clusters === 'object') {
         return Object.keys(config.clusters);
       }
@@ -314,6 +343,7 @@ WARNING: This failure has been recorded. After ${this.MAX_RETRY_ATTEMPTS} identi
         }
       }
 
+
       return null;
     } catch (error) {
       this.logger.debug('Error getting OpenSearch config path', { error });
@@ -334,4 +364,5 @@ WARNING: This failure has been recorded. After ${this.MAX_RETRY_ATTEMPTS} identi
       return null;
     }
   }
+
 }

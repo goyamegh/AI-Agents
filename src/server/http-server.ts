@@ -106,10 +106,14 @@ export class HTTPServer {
           return;
         }
 
+        // Set logger context for correlation
+        this.logger.setContext(input.threadId, input.runId);
+
         this.logger.info('Running agent via SSE streaming', {
           threadId: input.threadId,
           runId: input.runId,
-          messageCount: input.messages.length
+          messageCount: input.messages.length,
+          input: input
         });
 
         // Log HTTP request details for audit

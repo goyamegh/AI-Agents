@@ -107,6 +107,10 @@ export class BaseAGUIAdapter {
    */
   async runAgent(input: RunAgentInput): Promise<Observable<BaseEvent>> {
     const agentType = this.agent.getAgentType();
+
+    // Set logger context for correlation
+    this.logger.setContext(input.threadId, input.runId);
+
     this.logger.info(`Running ${agentType} agent with AG UI input`, {
       threadId: input.threadId,
       runId: input.runId,
@@ -199,21 +203,9 @@ export class BaseAGUIAdapter {
     );
 
     try {
-      // Extract the last user message text from AG UI format
-      const lastUserMessage = input.messages
-        .filter((msg) => msg.role === "user")
-        .pop();
-      if (!lastUserMessage) {
-        throw new Error("No user message found in input");
-      }
-
-      const messageText = Array.isArray(lastUserMessage.content)
-        ? lastUserMessage.content.find((item) => item.type === "text")?.text ||
-          ""
-        : lastUserMessage.content || "";
-
-      if (!messageText) {
-        throw new Error("No text content found in user message");
+      // Validate that we have messages
+      if (!input.messages || input.messages.length === 0) {
+        throw new Error("No messages found in input");
       }
 
       // Emit text message start event
@@ -231,13 +223,14 @@ export class BaseAGUIAdapter {
       );
 
       // Run the agent with streaming integration
+      // Pass the full messages array instead of extracting text
       await this.runAgentWithStreamingEvents(
-        messageText,
+        input.messages,  // Pass full messages array
         messageId,
         observer,
         input.threadId,
         input.runId,
-        input.messages
+        input  // Pass the full input
       );
 
       // Emit thinking end after agent reasoning
@@ -329,12 +322,12 @@ export class BaseAGUIAdapter {
    * Run agent with streaming content emission through observer
    */
   private async runAgentWithStreamingEvents(
-    userMessage: string,
+    messages: any[],  // Changed from userMessage: string to messages array
     messageId: string,
     observer: any,
     threadId: string,
     runId: string,
-    conversationHistory: any[]
+    fullInput?: RunAgentInput  // Add parameter for full input
   ): Promise<void> {
     const agentType = this.agent.getAgentType();
     try {
@@ -564,7 +557,18 @@ export class BaseAGUIAdapter {
       };
 
       // Use agent's callback-based processing
-      await this.agent.processMessageWithCallbacks(userMessage, callbacks, conversationHistory);
+      // Pass the messages array directly as the first parameter
+      // Pass additional inputs if agent supports it (check parameter count)
+      if (this.agent.processMessageWithCallbacks.length >= 3) {
+        await this.agent.processMessageWithCallbacks(messages, callbacks, {
+          state: fullInput?.state,
+          context: fullInput?.context,
+          threadId: fullInput?.threadId,
+          runId: fullInput?.runId
+        });
+      } else {
+        await this.agent.processMessageWithCallbacks(messages, callbacks);
+      }
     } catch (error) {
       const errorMessage =
         error instanceof Error ? error.message : String(error);

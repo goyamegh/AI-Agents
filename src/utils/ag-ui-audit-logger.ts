@@ -17,20 +17,6 @@ export class AGUIAuditLogger extends BaseLogger {
     super(auditDir);
   }
 
-  /**
-   * Convert Unix timestamp to human-readable format
-   */
-  private toHumanTimestamp(unixTimestamp: number): string {
-    return new Date(unixTimestamp).toLocaleString('en-US', {
-      year: 'numeric',
-      month: 'short',
-      day: '2-digit',        hour: '2-digit',
-      minute: '2-digit',
-      second: '2-digit',
-      hour12: true,
-      timeZoneName: 'short'
-    });
-  }
 
   /**
    * Start audit logging for a request

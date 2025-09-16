@@ -26,6 +26,11 @@ export interface ReactAgentState {
   shouldContinue: boolean;
   streamingCallbacks?: StreamingCallbacks;
   lastToolExecution?: number; // Timestamp of last tool execution
+  // Client-provided inputs from AG UI
+  clientState?: any;        // Store client's state object
+  clientContext?: any[];    // Store client's context array
+  threadId?: string;        // Store thread identifier
+  runId?: string;           // Store run identifier
 }
 
 /**
@@ -44,13 +49,12 @@ export class ReactAgent implements BaseAgent {
   private mcpClients: Record<string, BaseMCPClient> = {};
   private systemPrompt: string = '';
   private logger: Logger;
-  private cliConversationHistory: any[] = []; // For CLI mode only
   private graph?: StateGraph<ReactAgentState>;
   private compiledGraph?: any;
   private rl?: readline.Interface;
 
-  constructor() {
-    this.logger = new Logger();
+  constructor(logger?: Logger) {
+    this.logger = logger || new Logger();
     const region = process.env.AWS_REGION || 'us-east-1';
     
     this.bedrockClient = new BedrockRuntimeClient({
@@ -228,18 +232,39 @@ export class ReactAgent implements BaseAgent {
     this.logger.info('Processing input', {
       messageCount: state.messages.length,
       iterations: state.iterations,
-      maxIterations: state.maxIterations
+      maxIterations: state.maxIterations,
+      hasClientState: !!state.clientState,
+      hasClientContext: !!state.clientContext,
+      threadId: state.threadId,
+      runId: state.runId
     });
-    
+
     return {
-      currentStep: "processInput"
+      currentStep: "processInput",
+      // Preserve client inputs for downstream nodes
+      clientState: state.clientState,
+      clientContext: state.clientContext,
+      threadId: state.threadId,
+      runId: state.runId
       // Don't increment iterations here - only increment after tool execution
     };
   }
 
   private async callModelNode(state: ReactAgentState): Promise<Partial<ReactAgentState>> {
-    const { messages, streamingCallbacks, iterations, toolResults } = state;
-    
+    const { messages, streamingCallbacks, iterations, toolResults, clientState, clientContext, threadId, runId } = state;
+
+    // Log full state including client inputs
+    this.logger.info('React agent full state', {
+      clientState,
+      clientContext,
+      threadId,
+      runId,
+      iterations,
+      maxIterations: state.maxIterations,
+      messageCount: messages.length,
+      hasToolResults: Object.keys(toolResults).length > 0
+    });
+        
     this.logger.info('📥 callModelNode: Starting', {
       iterations,
       maxIterations: state.maxIterations,
@@ -277,11 +302,24 @@ export class ReactAgent implements BaseAgent {
     
     const toolConfig = shouldDisableTools ? undefined : this.prepareToolConfig(tools);
 
+    // Build enhanced system prompt with client context
+    let enhancedSystemPrompt = this.systemPrompt;
+    if (clientState || clientContext) {
+      enhancedSystemPrompt += '\n\n## Client Context Information\n';
+      if (clientState) {
+        enhancedSystemPrompt += `\nClient State:\n${JSON.stringify(clientState, null, 2)}\n`;
+      }
+      if (clientContext && clientContext.length > 0) {
+        enhancedSystemPrompt += `\nClient Context:\n${JSON.stringify(clientContext, null, 2)}\n`;
+      }
+      enhancedSystemPrompt += '\nPlease consider the above client state and context when responding.';
+    }
+
     // Create the command for Bedrock ConverseStream
     const command = new ConverseStreamCommand({
       modelId: "us.anthropic.claude-sonnet-4-20250514-v1:0",
       messages: bedrockMessages,
-      system: [{ text: this.systemPrompt }],
+      system: [{ text: enhancedSystemPrompt }],
       toolConfig: toolConfig,
       inferenceConfig: {
         maxTokens: 4096,
@@ -291,7 +329,7 @@ export class ReactAgent implements BaseAgent {
 
     try {
       // Log the actual messages being sent with full detail
-      this.logger.info('LLM Request Messages (detailed)', {
+      this.logger.info('LLM Request Messages ', {
         messageCount: bedrockMessages.length,
         messages: bedrockMessages
       });
@@ -426,7 +464,7 @@ export class ReactAgent implements BaseAgent {
   }
 
   private async executeToolsNode(state: ReactAgentState): Promise<Partial<ReactAgentState>> {
-    const { toolCalls, streamingCallbacks, messages } = state;
+    const { toolCalls, streamingCallbacks, messages, clientState, clientContext, threadId, runId } = state;
     const toolResults: Record<string, any> = {};
 
     this.logger.info('Executing tools', {
@@ -484,9 +522,19 @@ export class ReactAgent implements BaseAgent {
       });
       
       streamingCallbacks?.onToolUseStart?.(toolName, toolUseId, input);
-      
+
       try {
-        const result = await this.executeToolCall(toolName, input);
+        // Pass client context along with tool execution
+        const enhancedInput = {
+          ...input,
+          _clientContext: {
+            state: clientState,
+            context: clientContext,
+            threadId: threadId,
+            runId: runId
+          }
+        };
+        const result = await this.executeToolCall(toolName, enhancedInput);
         toolResults[toolUseId] = result;
         
         this.logger.info('Tool execution completed', {
@@ -576,15 +624,6 @@ export class ReactAgent implements BaseAgent {
 
   private async generateResponseNode(state: ReactAgentState): Promise<Partial<ReactAgentState>> {
     const { streamingCallbacks, messages, iterations } = state;
-    
-    // this.logger.info('✅ generateResponseNode: Generating final response', {
-    //   iterations,
-    //   maxIterations: state.maxIterations,
-    //   messageCount: messages.length,
-    //   lastMessageRole: messages[messages.length - 1]?.role,
-    //   hasResponse: messages[messages.length - 1]?.role === 'assistant'
-    // });
-    
     streamingCallbacks?.onTurnComplete?.();
     
     return {
@@ -1010,47 +1049,41 @@ Example: If user says "search the osd-ops cluster", use opensearch_cluster_name:
     return await client.executeTool(actualToolName, input);
   }
 
-  async processMessageWithCallbacks(message: string, callbacks: StreamingCallbacks, conversationHistory?: any[]): Promise<void> {
+  async processMessageWithCallbacks(
+    messages: any[],  // Full conversation history from UI
+    callbacks: StreamingCallbacks,
+    additionalInputs?: { state?: any; context?: any[]; threadId?: string; runId?: string }
+  ): Promise<void> {
     try {
-      // For server mode (with callbacks), use passed conversation history as-is
-      // For CLI mode (no callbacks), manage local history
-      let history: any[];
-
-      if (callbacks && conversationHistory) {
-        // Server mode: completely stateless, use client's history
-        history = conversationHistory;
-      } else {
-        // CLI mode: manage local history
-        const userMsg = { role: 'user', content: [{ text: message }] };
-        this.cliConversationHistory.push(userMsg);
-        history = this.cliConversationHistory;
+      // Set logger context for correlation with AG UI audits
+      if (additionalInputs?.threadId || additionalInputs?.runId) {
+        this.logger.setContext(additionalInputs.threadId, additionalInputs.runId);
       }
 
-      // Create initial state with conversation history
+      // Create initial state with the full conversation history
       const initialState: ReactAgentState = {
-        messages: history,
+        messages: messages,  // Use the messages directly from UI
         currentStep: "processInput",
         toolCalls: [],
         toolResults: {},
         iterations: 0,
         maxIterations: REACT_MAX_ITERATIONS,
         shouldContinue: true,
-        streamingCallbacks: callbacks
+        streamingCallbacks: callbacks,
+        // Add client inputs to initial state
+        clientState: additionalInputs?.state,
+        clientContext: additionalInputs?.context,
+        threadId: additionalInputs?.threadId,
+        runId: additionalInputs?.runId
       };
 
-      // Run the graph with thread configuration for memory persistence
+      // Run the graph - unique config per request for stateless operation
       const config = {
-        configurable: { thread_id: "default_session" }
-      };
-      const finalState = await this.compiledGraph.invoke(initialState, config);
-
-      // Update CLI history only if in CLI mode (no callbacks)
-      if (!callbacks) {
-        // Add the final assistant response to CLI history
-        if (finalState.messages.length > this.cliConversationHistory.length) {
-          this.cliConversationHistory.push(finalState.messages[finalState.messages.length - 1]);
+        configurable: {
+          thread_id: `${additionalInputs?.threadId || 'session'}_${additionalInputs?.runId || Date.now()}`
         }
-      }
+      };
+      await this.compiledGraph.invoke(initialState, config);
 
     } catch (error) {
       const errorMessage = error instanceof Error ? error.message : String(error);
@@ -1060,7 +1093,12 @@ Example: If user says "search the osd-ops cluster", use opensearch_cluster_name:
   }
 
   async sendMessage(message: string): Promise<void> {
-    // For CLI mode - simple console output (same as Jarvis)
+    // For CLI mode - create a simple message array with just the user message
+    // In CLI mode, we don't maintain conversation history (stateless)
+    const messages = [
+      { role: 'user', content: [{ text: message }] }
+    ];
+
     const callbacks: StreamingCallbacks = {
       onTextStart: (text: string) => {
         process.stdout.write(text);
@@ -1086,7 +1124,7 @@ Example: If user says "search the osd-ops cluster", use opensearch_cluster_name:
       }
     };
 
-    await this.processMessageWithCallbacks(message, callbacks);
+    await this.processMessageWithCallbacks(messages, callbacks);
   }
 
   getAllTools(): any[] {

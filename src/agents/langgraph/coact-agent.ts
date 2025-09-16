@@ -11,6 +11,7 @@ import { BaseAgent, StreamingCallbacks } from '../base-agent';
 import readline from 'readline';
 import { v4 as uuidv4 } from 'uuid';
 import { getPrometheusMetricsEmitter } from '../../utils/metrics-emitter';
+import { truncateToolResult } from '../../utils/truncate-tool-result';
 
 // Configuration constants
 const COACT_MAX_ITERATIONS = 10; // Maximum tool execution cycles before forcing final response
@@ -59,6 +60,11 @@ export interface CoActAgentState {
   toolResults: Record<string, any>;
   lastToolExecution?: number;
   streamingCallbacks?: StreamingCallbacks;
+  // Client-provided inputs from AG UI
+  clientState?: any;        // Store client's state object
+  clientContext?: any[];    // Store client's context array
+  threadId?: string;        // Store thread identifier
+  runId?: string;           // Store run identifier
 }
 
 /**
@@ -78,7 +84,6 @@ export class CoActAgent implements BaseAgent {
   private mcpClients: Record<string, BaseMCPClient> = {};
   private systemPrompt: string = '';
   private logger: Logger;
-  private cliConversationHistory: any[] = []; // For CLI mode only
   private graph?: StateGraph<CoActAgentState>;
   private compiledGraph?: any;
   private rl?: readline.Interface;
@@ -296,11 +301,20 @@ export class CoActAgent implements BaseAgent {
     this.logger.info('Processing input', {
       messageCount: state.messages.length,
       iterations: state.iterations,
-      maxIterations: state.maxIterations
+      maxIterations: state.maxIterations,
+      hasClientState: !!state.clientState,
+      hasClientContext: !!state.clientContext,
+      threadId: state.threadId,
+      runId: state.runId
     });
 
     return {
-      currentStep: "processInput"
+      currentStep: "processInput",
+      // Preserve client inputs for downstream nodes
+      clientState: state.clientState,
+      clientContext: state.clientContext,
+      threadId: state.threadId,
+      runId: state.runId
       // Don't increment iterations here - only increment after tool execution
     };
   }
@@ -446,14 +460,26 @@ Remember: Output ONLY the JSON object, no additional text.`;
   }
 
   private async callModelNode(state: CoActAgentState): Promise<Partial<CoActAgentState>> {
-    const { messages, streamingCallbacks, iterations, toolResults } = state;
-    
+    const { messages, streamingCallbacks, iterations, toolResults, clientState, clientContext, threadId, runId } = state;
+
+    // Log full state including client inputs
+    this.logger.info('CoAct agent full state', {
+      clientState,
+      clientContext,
+      threadId,
+      runId,
+      iterations,
+      maxIterations: state.maxIterations,
+      messageCount: messages.length,
+      hasToolResults: Object.keys(toolResults).length > 0
+    });
+
     this.logger.info('📥 callModelNode: Starting', {
       iterations,
       maxIterations: state.maxIterations,
       messageCount: messages.length,
       lastMessageRole: messages[messages.length - 1]?.role,
-      lastMessageContent: messages[messages.length - 1]?.content ? 
+      lastMessageContent: messages[messages.length - 1]?.content ?
         JSON.stringify(messages[messages.length - 1].content).substring(0, 100) : 'undefined'
     });
     
@@ -485,11 +511,24 @@ Remember: Output ONLY the JSON object, no additional text.`;
     
     const toolConfig = shouldDisableTools ? undefined : this.prepareToolConfig(tools);
 
+    // Build enhanced system prompt with client context
+    let enhancedSystemPrompt = this.systemPrompt;
+    if (clientState || clientContext) {
+      enhancedSystemPrompt += '\n\n## Client Context Information\n';
+      if (clientState) {
+        enhancedSystemPrompt += `\nClient State:\n${JSON.stringify(clientState, null, 2)}\n`;
+      }
+      if (clientContext && clientContext.length > 0) {
+        enhancedSystemPrompt += `\nClient Context:\n${JSON.stringify(clientContext, null, 2)}\n`;
+      }
+      enhancedSystemPrompt += '\nPlease consider the above client state and context when responding.';
+    }
+
     // Create the command for Bedrock ConverseStream
     const command = new ConverseStreamCommand({
       modelId: "us.anthropic.claude-sonnet-4-20250514-v1:0",
       messages: bedrockMessages,
-      system: [{ text: this.systemPrompt }],
+      system: [{ text: enhancedSystemPrompt }],
       toolConfig: toolConfig,
       inferenceConfig: {
         maxTokens: 4096,
@@ -806,7 +845,7 @@ Remember: Output ONLY the JSON object, no additional text.`;
   }
 
   private async executeToolsNode(state: CoActAgentState): Promise<Partial<CoActAgentState>> {
-    const { toolCalls, streamingCallbacks, messages } = state;
+    const { toolCalls, streamingCallbacks, messages, clientState, clientContext, threadId, runId } = state;
     const toolResults: Record<string, any> = {};
 
     this.logger.info('Executing tools', {
@@ -864,9 +903,19 @@ Remember: Output ONLY the JSON object, no additional text.`;
       });
       
       streamingCallbacks?.onToolUseStart?.(toolName, toolUseId, input);
-      
+
       try {
-        const result = await this.executeToolCall(toolName, input);
+        // Pass client context along with tool execution
+        const enhancedInput = {
+          ...input,
+          _clientContext: {
+            state: clientState,
+            context: clientContext,
+            threadId: threadId,
+            runId: runId
+          }
+        };
+        const result = await this.executeToolCall(toolName, enhancedInput);
         toolResults[toolUseId] = result;
         
         this.logger.info('Tool execution completed', {
@@ -913,12 +962,16 @@ Remember: Output ONLY the JSON object, no additional text.`;
     
     // Create user message with tool result blocks for all executed tools
     // CRITICAL: Ensure content array is not empty
-    const toolResultContent = newToolCalls.map(tc => ({
-      toolResult: {
-        toolUseId: tc.toolUseId,
-        content: [{ text: JSON.stringify(toolResults[tc.toolUseId] || { error: 'No result found' }) }]
-      }
-    }));
+    const toolResultContent = newToolCalls.map(tc => {
+      // Truncate tool result to prevent API input size errors
+      const truncatedResult = truncateToolResult(toolResults[tc.toolUseId] || { error: 'No result found' });
+      return {
+        toolResult: {
+          toolUseId: tc.toolUseId,
+          content: [{ text: truncatedResult }]
+        }
+      };
+    });
     
     // Only create the message if we have tool results
     if (toolResultContent.length === 0) {
@@ -1304,25 +1357,20 @@ ${JSON.stringify(results, null, 2)}`;
     return await client.executeTool(actualToolName, input);
   }
 
-  async processMessageWithCallbacks(message: string, callbacks: StreamingCallbacks, conversationHistory?: any[]): Promise<void> {
+  async processMessageWithCallbacks(
+    messages: any[],  // Full conversation history from UI
+    callbacks: StreamingCallbacks,
+    additionalInputs?: { state?: any; context?: any[]; threadId?: string; runId?: string }
+  ): Promise<void> {
     try {
-      // For server mode (with callbacks), use passed conversation history as-is
-      // For CLI mode (no callbacks), manage local history
-      let history: any[];
-
-      if (callbacks && conversationHistory) {
-        // Server mode: completely stateless, use client's history
-        history = conversationHistory;
-      } else {
-        // CLI mode: manage local history
-        const userMsg = { role: 'user', content: [{ text: message }] };
-        this.cliConversationHistory.push(userMsg);
-        history = this.cliConversationHistory;
+      // Set logger context for correlation with AG UI audits
+      if (additionalInputs?.threadId || additionalInputs?.runId) {
+        this.logger.setContext(additionalInputs.threadId, additionalInputs.runId);
       }
 
-      // Create initial state for todo-list approach
+      // Create initial state for todo-list approach with full conversation history
       const initialState: CoActAgentState = {
-        messages: history,
+        messages: messages,  // Use the messages directly from UI
         currentStep: "planning",
         todoList: {
           todos: [],
@@ -1332,7 +1380,7 @@ ${JSON.stringify(results, null, 2)}`;
           requiresFinalFormatting: false,
           totalExecutionTime: 0,
           metadata: {
-            userRequest: message,
+            userRequest: "",  // Will be extracted from messages if needed
             planningTime: 0,
             executionStartTime: 0
           }
@@ -1344,21 +1392,21 @@ ${JSON.stringify(results, null, 2)}`;
         shouldContinue: true,
         toolCalls: [],
         toolResults: {},
-        streamingCallbacks: callbacks
+        streamingCallbacks: callbacks,
+        // Add client inputs to initial state
+        clientState: additionalInputs?.state,
+        clientContext: additionalInputs?.context,
+        threadId: additionalInputs?.threadId,
+        runId: additionalInputs?.runId
       };
 
-      // Run the graph with thread configuration for memory persistence
+      // Run the graph - unique config per request for stateless operation
       const config = {
-        configurable: { thread_id: "default_session" }
+        configurable: {
+          thread_id: `${additionalInputs?.threadId || 'session'}_${additionalInputs?.runId || Date.now()}`
+        }
       };
-      const finalState = await this.compiledGraph.invoke(initialState, config);
-
-      // Update CLI history only if in CLI mode (no callbacks)
-      if (!callbacks) {
-        this.cliConversationHistory.push(
-          { role: 'assistant', content: [{ text: 'Response processed via todo-list execution' }] }
-        );
-      }
+      await this.compiledGraph.invoke(initialState, config);
 
       // TODO: Implement long-term memory persistence here
       // This would compress and store the execution context for future reference
@@ -1371,7 +1419,12 @@ ${JSON.stringify(results, null, 2)}`;
   }
 
   async sendMessage(message: string): Promise<void> {
-    // For CLI mode - simple console output (same as Jarvis)
+    // For CLI mode - create a simple message array with just the user message
+    // In CLI mode, we don't maintain conversation history (stateless)
+    const messages = [
+      { role: 'user', content: [{ text: message }] }
+    ];
+
     const callbacks: StreamingCallbacks = {
       onTextStart: (text: string) => {
         process.stdout.write(text);
@@ -1397,7 +1450,7 @@ ${JSON.stringify(results, null, 2)}`;
       }
     };
 
-    await this.processMessageWithCallbacks(message, callbacks);
+    await this.processMessageWithCallbacks(messages, callbacks);
   }
 
   getAllTools(): any[] {

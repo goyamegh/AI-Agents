@@ -5,6 +5,7 @@ import { BaseMCPClient, LocalMCPClient, HTTPMCPClient } from '../../mcp/index';
 import { MCPServerConfig } from '../../types/mcp-types';
 import { Logger } from '../../utils/logger';
 import { BaseAgent, StreamingCallbacks } from '../base-agent';
+import { truncateToolResult } from '../../utils/truncate-tool-result';
 
 export class JarvisAgent implements BaseAgent {
   private bedrockClient: BedrockRuntimeClient;
@@ -524,10 +525,12 @@ Remember: Tool parameter validation errors should trigger immediate self-correct
                     console.log(`✅ Tool result: ${JSON.stringify(toolResult, null, 2)}`);
                   }
                   
+                  // Truncate tool result to prevent API input size errors
+                  const truncatedResult = truncateToolResult(toolResult);
                   toolResults.push({
                     toolResult: {
                       toolUseId: toolStream.toolUseId,
-                      content: [{ text: JSON.stringify(toolResult) }]
+                      content: [{ text: truncatedResult }]
                     }
                   });
                 } catch (error) {

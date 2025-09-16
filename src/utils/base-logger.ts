@@ -46,6 +46,23 @@ export abstract class BaseLogger {
   }
 
   /**
+   * Convert Unix timestamp to human-readable format in PDT
+   */
+  protected toHumanTimestamp(unixTimestamp: number): string {
+    return new Date(unixTimestamp).toLocaleString('en-US', {
+      year: 'numeric',
+      month: 'short',
+      day: '2-digit',
+      hour: '2-digit',
+      minute: '2-digit',
+      second: '2-digit',
+      hour12: false,
+      timeZone: 'America/Los_Angeles',
+      timeZoneName: 'short'
+    });
+  }
+
+  /**
    * Generate date string for file naming (YYYY-MM-DD)
    */
   protected getDateString(timestamp?: number): string {

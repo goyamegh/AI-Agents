@@ -17,9 +17,16 @@ export interface BaseAgent {
   initialize(configs: Record<string, MCPServerConfig>, customSystemPrompt?: string): Promise<void>;
 
   /**
-   * Process a user message with streaming callbacks
+   * Process messages with streaming callbacks
+   * @param messages Full conversation history from UI
+   * @param callbacks Streaming callbacks for real-time updates
+   * @param additionalInputs Optional client state and context
    */
-  processMessageWithCallbacks(message: string, callbacks: StreamingCallbacks, conversationHistory?: any[]): Promise<void>;
+  processMessageWithCallbacks(
+    messages: any[],  // Changed from string to array - full conversation history
+    callbacks: StreamingCallbacks,
+    additionalInputs?: { state?: any; context?: any[]; threadId?: string; runId?: string }
+  ): Promise<void>;
 
   /**
    * Send a message and process response (for CLI mode)

@@ -4,10 +4,20 @@ import { BaseLogger } from './base-logger';
 // Logger utility with hourly rotation
 export class Logger extends BaseLogger {
   private currentLogFile: string = '';
+  private threadId?: string;
+  private runId?: string;
 
   constructor(logDir: string = join(__dirname, '../../logs')) {
     super(logDir);
     this.updateLogFile();
+  }
+
+  /**
+   * Set thread and run IDs for correlation with AG UI audits
+   */
+  setContext(threadId?: string, runId?: string): void {
+    this.threadId = threadId;
+    this.runId = runId;
   }
 
   private updateLogFile(): void {
@@ -26,7 +36,15 @@ export class Logger extends BaseLogger {
 
   private formatMessage(level: string, message: string, data?: any): string {
     const timestamp = this.getTimestamp();
-    const logEntry = `[${timestamp.iso}] ${level}: ${message}`;
+    const pdtTime = this.toHumanTimestamp(timestamp.unix);
+
+    // Include thread_id and run_id if available
+    const context = [];
+    if (this.threadId) context.push(`thread_id=${this.threadId}`);
+    if (this.runId) context.push(`run_id=${this.runId}`);
+    const contextStr = context.length > 0 ? ` [${context.join(', ')}]` : '';
+
+    const logEntry = `[${pdtTime}] ${contextStr} ${level}: ${message}`;
     return data ? `${logEntry} ${JSON.stringify(data, null, 2)}` : logEntry;
   }
 
@@ -83,6 +101,14 @@ export class Logger extends BaseLogger {
   stream(message: string): void {
     this.updateLogFile();
     const timestamp = this.getTimestamp();
-    this.writeToFile(this.currentLogFile, `[${timestamp.iso}] STREAM: ${message}\n`);
+    const pdtTime = this.toHumanTimestamp(timestamp.unix);
+
+    // Include thread_id and run_id if available
+    const context = [];
+    if (this.threadId) context.push(`thread_id=${this.threadId}`);
+    if (this.runId) context.push(`run_id=${this.runId}`);
+    const contextStr = context.length > 0 ? ` [${context.join(', ')}]` : '';
+
+    this.writeToFile(this.currentLogFile, `[${pdtTime}] ${contextStr} STREAM: ${message}\n`);
   }
 }

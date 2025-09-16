@@ -62,7 +62,7 @@ export class LangGraphAGUIAdapter extends BaseAGUIAdapter {
    */
   async runAgent(input: RunAgentInput): Promise<Observable<BaseEvent>> {
     const baseObservable = await super.runAgent(input);
-    
+
     // Return a new observable that enhances base events with LangGraph specifics
     return new Observable<BaseEvent>((observer) => {
       // Initialize LangGraph state tracking
