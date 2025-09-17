@@ -419,12 +419,14 @@ export class ReactAgent implements BaseAgent {
         // Subsequent iteration with tool calls - DON'T add another assistant message
         // The previous assistant message with tool_use is already in the history
         // We just need to track the new tool calls to execute
-        this.logger.info('📝 Continuation with tools: NOT adding duplicate assistant message', {
-          previousMessageCount: messages.length,
-          iterations,
-          hasToolCalls: true,
-          reason: 'Previous assistant message with tool_use already exists'
-        });
+        //remove this log
+
+        // this.logger.info('📝 Continuation with tools: NOT adding duplicate assistant message', {
+        //   previousMessageCount: messages.length,
+        //   iterations,
+        //   hasToolCalls: true,
+        //   reason: 'Previous assistant message with tool_use already exists'
+        // });
         
         return {
           messages: [], // Don't add any new messages, just update tool calls
@@ -472,6 +474,7 @@ export class ReactAgent implements BaseAgent {
     this.logger.info('Executing tools', {
       toolCallsCount: toolCalls.length,
       toolNames: toolCalls.map(tc => tc.toolName),
+      toolIds: toolCalls.map(tc => tc.toolUseId),
       currentIterations: state.iterations,
       maxIterations: state.maxIterations
     });

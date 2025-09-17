@@ -1,0 +1,449 @@
+#!/usr/bin/env node
+import { Client } from '@opensearch-project/opensearch';
+import * as fs from 'fs';
+import * as path from 'path';
+import * as readline from 'readline';
+import * as dotenv from 'dotenv';
+import { format } from 'date-fns';
+
+dotenv.config({ path: path.join(__dirname, '..', '.env') });
+
+interface LogEntry {
+  timestamp: string;
+  level: string;
+  message: string;
+  source: 'logs' | 'audit-logs' | 'metrics';
+  filename: string;
+  raw: string;
+  thread_id?: string;
+  run_id?: string;
+  ingestion_timestamp?: string;
+  [key: string]: any;
+}
+
+interface MetricEntry {
+  timestamp: string;
+  metric_name: string;
+  metric_type: string;
+  metric_value?: number;
+  source: 'metrics';
+  filename: string;
+  raw: string;
+  ingestion_timestamp?: string;
+}
+
+class OpenSearchIngestor {
+  private client: Client;
+  private batchSize: number = 100;
+  private processedFiles: Set<string> = new Set();
+  private stateFile: string;
+
+  constructor() {
+    const opensearchUrl = process.env.EXTERNAL_OPENSEARCH_URL;
+    const username = process.env.EXTERNAL_OPENSEARCH_USERNAME;
+    const password = process.env.EXTERNAL_OPENSEARCH_PASSWORD;
+
+    if (!opensearchUrl || !username || !password) {
+      throw new Error('OpenSearch credentials not found in .env file');
+    }
+
+    this.client = new Client({
+      node: opensearchUrl,
+      auth: {
+        username,
+        password
+      },
+      ssl: {
+        rejectUnauthorized: false
+      }
+    });
+
+    this.stateFile = path.join(__dirname, '..', '.opensearch-ingest-state.json');
+    this.loadState();
+  }
+
+  private loadState(): void {
+    try {
+      if (fs.existsSync(this.stateFile)) {
+        const state = JSON.parse(fs.readFileSync(this.stateFile, 'utf-8'));
+        this.processedFiles = new Set(state.processedFiles || []);
+      }
+    } catch (error) {
+      console.error('Error loading state:', error);
+    }
+  }
+
+  private saveState(): void {
+    try {
+      const state = {
+        processedFiles: Array.from(this.processedFiles),
+        lastRun: new Date().toISOString()
+      };
+      fs.writeFileSync(this.stateFile, JSON.stringify(state, null, 2));
+    } catch (error) {
+      console.error('Error saving state:', error);
+    }
+  }
+
+  private getDailyIndexName(type: 'logs' | 'audit-logs' | 'metrics'): string {
+    const today = format(new Date(), 'yyyy.MM.dd');
+    switch(type) {
+      case 'logs':
+        return `ai-agent-logs-${today}`;
+      case 'audit-logs':
+        return `ai-agent-audit-logs-${today}`;
+      case 'metrics':
+        return `ai-agent-metrics-${today}`;
+      default:
+        return `ai-agent-logs-${today}`;
+    }
+  }
+
+  private async createIndexIfNotExists(indexName: string): Promise<void> {
+    try {
+      const exists = await this.client.indices.exists({ index: indexName });
+      if (!exists.body) {
+        await this.client.indices.create({
+          index: indexName,
+          body: {
+            settings: {
+              number_of_shards: 1,
+              number_of_replicas: 1
+            },
+            mappings: {
+              properties: {
+                timestamp: {
+                  type: 'date',
+                  format: 'strict_date_optional_time||epoch_millis||yyyy-MM-dd HH:mm:ss||MMM dd, yyyy, HH:mm:ss z'
+                },
+                level: { type: 'keyword' },
+                message: { type: 'text' },
+                source: { type: 'keyword' },
+                filename: { type: 'keyword' },
+                thread_id: { type: 'keyword' },
+                run_id: { type: 'keyword' },
+                metric_name: { type: 'keyword' },
+                metric_type: { type: 'keyword' },
+                metric_value: { type: 'float' },
+                raw: { type: 'text' },
+                ingestion_timestamp: { type: 'date' }
+              }
+            }
+          }
+        });
+        console.log(`Created index: ${indexName}`);
+      }
+    } catch (error) {
+      console.error(`Error creating index ${indexName}:`, error);
+    }
+  }
+
+  private parseLogLine(line: string, filename: string): LogEntry | null {
+    try {
+      // Skip empty lines
+      if (!line.trim()) return null;
+
+      // Parse different log formats
+      const isoTimestampMatch = line.match(/^\[(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z)\]\s+(\w+):\s+(.*)/);
+      const readableTimestampMatch = line.match(/^\[([^\]]+)\]\s+(?:\[([^\]]+)\])?\s*(\w+):\s+(.*)/);
+
+      let entry: LogEntry | null = null;
+
+      if (isoTimestampMatch) {
+        // ISO format timestamp - use as-is
+        entry = {
+          timestamp: isoTimestampMatch[1],
+          level: isoTimestampMatch[2],
+          message: isoTimestampMatch[3],
+          source: filename.includes('audit') ? 'audit-logs' : 'logs',
+          filename,
+          raw: line,
+          ingestion_timestamp: new Date().toISOString()
+        };
+      } else if (readableTimestampMatch) {
+        const dateStr = readableTimestampMatch[1];
+        const contextInfo = readableTimestampMatch[2];
+        const level = readableTimestampMatch[3];
+        const message = readableTimestampMatch[4];
+
+        // Keep the original timestamp string - OpenSearch will parse it
+        // The format "Sep 16, 2025, 15:38:44 PDT" should work with our mapping
+        entry = {
+          timestamp: dateStr,
+          level,
+          message,
+          source: filename.includes('audit') ? 'audit-logs' : 'logs',
+          filename,
+          raw: line,
+          ingestion_timestamp: new Date().toISOString()
+        };
+
+        // Extract thread_id and run_id if present
+        if (contextInfo) {
+          const threadMatch = contextInfo.match(/thread_id=([^,\s]+)/);
+          const runMatch = contextInfo.match(/run_id=([^,\s]+)/);
+          if (threadMatch) entry.thread_id = threadMatch[1];
+          if (runMatch) entry.run_id = runMatch[1];
+        }
+      } else if (line.trim()) {
+        // Default fallback for unparsed lines - extract file timestamp if possible
+        const fileTimestamp = this.extractTimestampFromFilename(filename);
+        entry = {
+          timestamp: fileTimestamp || new Date().toISOString(),
+          level: 'INFO',
+          message: line,
+          source: filename.includes('audit') ? 'audit-logs' : 'logs',
+          filename,
+          raw: line,
+          ingestion_timestamp: new Date().toISOString()
+        };
+      }
+
+      return entry;
+    } catch (error) {
+      console.error(`Error parsing log line: ${error}`);
+      console.error(`Problem line: ${line}`);
+      return null;
+    }
+  }
+
+  private extractTimestampFromFilename(filename: string): string | null {
+    // Extract timestamp from filename like "ai-agent-2025-09-16-15.log"
+    const match = filename.match(/(\d{4})-(\d{2})-(\d{2})-(\d{2})/);
+    if (match) {
+      const [_, year, month, day, hour] = match;
+      return `${year}-${month}-${day}T${hour}:00:00.000Z`;
+    }
+    return null;
+  }
+
+  private parseMetricLine(line: string, filename: string): MetricEntry | null {
+    try {
+      if (line.startsWith('#')) {
+        // Parse Prometheus comment lines
+        const helpMatch = line.match(/^# HELP (\w+) (.*)/);
+        const typeMatch = line.match(/^# TYPE (\w+) (\w+)/);
+
+        const fileTimestamp = this.extractTimestampFromFilename(filename);
+
+        if (helpMatch) {
+          return {
+            timestamp: fileTimestamp || new Date().toISOString(),
+            metric_name: helpMatch[1],
+            metric_type: 'help',
+            source: 'metrics',
+            filename,
+            raw: line,
+            ingestion_timestamp: new Date().toISOString()
+          };
+        } else if (typeMatch) {
+          return {
+            timestamp: fileTimestamp || new Date().toISOString(),
+            metric_name: typeMatch[1],
+            metric_type: typeMatch[2],
+            source: 'metrics',
+            filename,
+            raw: line,
+            ingestion_timestamp: new Date().toISOString()
+          };
+        }
+      } else {
+        // Parse metric value lines
+        const metricMatch = line.match(/^(\w+)(?:\{([^}]*)\})?\s+([\d.]+)/);
+        if (metricMatch) {
+          const fileTimestamp = this.extractTimestampFromFilename(filename);
+          return {
+            timestamp: fileTimestamp || new Date().toISOString(),
+            metric_name: metricMatch[1],
+            metric_type: 'value',
+            metric_value: parseFloat(metricMatch[3]),
+            source: 'metrics',
+            filename,
+            raw: line,
+            ingestion_timestamp: new Date().toISOString()
+          };
+        }
+      }
+      return null;
+    } catch (error) {
+      console.error(`Error parsing metric line: ${error}`);
+      return null;
+    }
+  }
+
+  private async processFile(filePath: string, type: 'logs' | 'audit-logs' | 'metrics'): Promise<void> {
+    if (this.processedFiles.has(filePath)) {
+      console.log(`Skipping already processed file: ${filePath}`);
+      return;
+    }
+
+    console.log(`Processing ${type} file: ${filePath}`);
+    const filename = path.basename(filePath);
+    const fileStream = fs.createReadStream(filePath);
+    const rl = readline.createInterface({
+      input: fileStream,
+      crlfDelay: Infinity
+    });
+
+    let batch: any[] = [];
+    const indexName = this.getDailyIndexName(type);
+
+    for await (const line of rl) {
+      if (!line.trim()) continue;
+
+      let entry: any = null;
+      if (type === 'metrics') {
+        entry = this.parseMetricLine(line, filename);
+      } else {
+        entry = this.parseLogLine(line, filename);
+      }
+
+      if (entry) {
+        batch.push(entry);
+
+        if (batch.length >= this.batchSize) {
+          await this.bulkIndex(batch, indexName);
+          batch = [];
+        }
+      }
+    }
+
+    // Index remaining entries
+    if (batch.length > 0) {
+      await this.bulkIndex(batch, indexName);
+    }
+
+    this.processedFiles.add(filePath);
+    this.saveState();
+    console.log(`Completed processing ${filePath}`);
+  }
+
+  private async bulkIndex(entries: any[], indexName: string): Promise<void> {
+    if (entries.length === 0) return;
+
+    const body = entries.flatMap(doc => [
+      { index: { _index: indexName } },
+      doc
+    ]);
+
+    try {
+      const response = await this.client.bulk({ body });
+      if (response.body.errors) {
+        console.error('Bulk indexing errors:', JSON.stringify(response.body.errors));
+      } else {
+        console.log(`Successfully indexed ${entries.length} documents to ${indexName}`);
+      }
+    } catch (error) {
+      console.error('Error during bulk indexing:', error);
+    }
+  }
+
+  public async ingestAll(): Promise<void> {
+    const baseDir = path.join(__dirname, '..');
+
+    // Create indices for each type
+    await this.createIndexIfNotExists(this.getDailyIndexName('logs'));
+    await this.createIndexIfNotExists(this.getDailyIndexName('audit-logs'));
+    await this.createIndexIfNotExists(this.getDailyIndexName('metrics'));
+
+    // Process logs
+    const logsDir = path.join(baseDir, 'logs');
+    if (fs.existsSync(logsDir)) {
+      const logFiles = fs.readdirSync(logsDir)
+        .filter(f => f.endsWith('.log'))
+        .map(f => path.join(logsDir, f));
+
+      for (const file of logFiles) {
+        await this.processFile(file, 'logs');
+      }
+    }
+
+    // Process audit logs
+    const auditLogsDir = path.join(baseDir, 'audit-logs');
+    if (fs.existsSync(auditLogsDir)) {
+      const auditFiles = fs.readdirSync(auditLogsDir)
+        .filter(f => f.endsWith('.log'))
+        .map(f => path.join(auditLogsDir, f));
+
+      for (const file of auditFiles) {
+        await this.processFile(file, 'audit-logs');
+      }
+    }
+
+    // Process metrics
+    const metricsDir = path.join(baseDir, 'metrics');
+    if (fs.existsSync(metricsDir)) {
+      const metricFiles = fs.readdirSync(metricsDir)
+        .filter(f => f.endsWith('.prom'))
+        .map(f => path.join(metricsDir, f));
+
+      for (const file of metricFiles) {
+        await this.processFile(file, 'metrics');
+      }
+    }
+
+    console.log('Ingestion complete!');
+  }
+
+  public async watchAndIngest(): Promise<void> {
+    console.log('Starting continuous ingestion with file watching...');
+
+    // Initial ingestion
+    await this.ingestAll();
+
+    // Watch for new files
+    const baseDir = path.join(__dirname, '..');
+    const dirs = [
+      { path: path.join(baseDir, 'logs'), type: 'logs' as const },
+      { path: path.join(baseDir, 'audit-logs'), type: 'audit-logs' as const },
+      { path: path.join(baseDir, 'metrics'), type: 'metrics' as const }
+    ];
+
+    for (const dir of dirs) {
+      if (fs.existsSync(dir.path)) {
+        fs.watch(dir.path, async (eventType, filename) => {
+          if (eventType === 'change' || eventType === 'rename') {
+            const filePath = path.join(dir.path, filename);
+            if (fs.existsSync(filePath) && !this.processedFiles.has(filePath)) {
+              console.log(`New file detected: ${filePath}`);
+              await this.processFile(filePath, dir.type);
+            }
+          }
+        });
+        console.log(`Watching directory: ${dir.path}`);
+      }
+    }
+
+    // Keep process running
+    process.on('SIGINT', () => {
+      console.log('Shutting down gracefully...');
+      this.saveState();
+      process.exit(0);
+    });
+  }
+}
+
+// Main execution
+async function main() {
+  const ingestor = new OpenSearchIngestor();
+
+  const args = process.argv.slice(2);
+  const watchMode = args.includes('--watch') || args.includes('-w');
+
+  try {
+    if (watchMode) {
+      await ingestor.watchAndIngest();
+    } else {
+      await ingestor.ingestAll();
+    }
+  } catch (error) {
+    console.error('Fatal error:', error);
+    process.exit(1);
+  }
+}
+
+if (require.main === module) {
+  main();
+}
+
+export { OpenSearchIngestor };
