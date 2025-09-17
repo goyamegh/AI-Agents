@@ -106,13 +106,18 @@ export class ReactAgent implements BaseAgent {
     // Load system prompt - now that MCP clients are connected, we can generate dynamic prompt
     if (customSystemPrompt) {
       this.systemPrompt = this.enhanceSystemPrompt(customSystemPrompt);
-      this.logger.info('Using enhanced custom system prompt with dynamic content');
+      this.logger.info('Using enhanced custom system prompt with dynamic content', {
+        customPromptLength: customSystemPrompt.length,
+        finalPromptLength: this.systemPrompt.length,
+        customPromptPreview: customSystemPrompt.substring(0, 200) + '...'
+      });
     } else {
       // Always use dynamic system prompt that describes actual MCP tools
       this.systemPrompt = this.getDefaultSystemPrompt();
       this.logger.info('Using dynamic system prompt with MCP tools', {
         promptLength: this.systemPrompt.length,
-        connectedServers: Object.keys(this.mcpClients).length
+        connectedServers: Object.keys(this.mcpClients).length,
+        promptPreview: this.systemPrompt.substring(0, 200) + '...'
       });
     }
 

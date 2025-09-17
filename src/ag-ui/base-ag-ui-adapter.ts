@@ -8,6 +8,7 @@
 
 import { v4 as uuidv4 } from "uuid";
 import { readFileSync, existsSync } from "fs";
+import { resolve } from "path";
 import { Observable } from "rxjs";
 import {
   EventType,
@@ -76,14 +77,18 @@ export class BaseAGUIAdapter {
     const systemPromptPath = process.env.SYSTEM_PROMPT;
     if (systemPromptPath) {
       try {
-        if (existsSync(systemPromptPath)) {
-          customSystemPrompt = readFileSync(systemPromptPath, "utf-8");
+        // Resolve relative paths relative to the project root (where package.json is)
+        const resolvedPath = resolve(process.cwd(), systemPromptPath);
+        if (existsSync(resolvedPath)) {
+          customSystemPrompt = readFileSync(resolvedPath, "utf-8");
           this.logger.info("Using custom system prompt from file", {
-            path: systemPromptPath,
+            originalPath: systemPromptPath,
+            resolvedPath: resolvedPath,
           });
         } else {
           this.logger.warn("System prompt file not found", {
-            path: systemPromptPath,
+            originalPath: systemPromptPath,
+            resolvedPath: resolvedPath,
           });
         }
       } catch (error) {
