@@ -164,6 +164,23 @@ export class ReactAgent implements BaseAgent {
         streamingCallbacks: {
           value: (x: any, y: any) => y || x,
           default: () => undefined
+        },
+        // Client-provided inputs - preserve throughout graph execution
+        clientState: {
+          value: (x: any, y: any) => y || x,
+          default: () => undefined
+        },
+        clientContext: {
+          value: (x: any[], y: any[]) => y || x,
+          default: () => undefined
+        },
+        threadId: {
+          value: (x: string, y: string) => y || x,
+          default: () => undefined
+        },
+        runId: {
+          value: (x: string, y: string) => y || x,
+          default: () => undefined
         }
       }
     });
