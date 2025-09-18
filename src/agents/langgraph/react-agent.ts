@@ -30,6 +30,7 @@ export interface ReactAgentState {
   // Client-provided inputs from AG UI
   clientState?: any;        // Store client's state object
   clientContext?: any[];    // Store client's context array
+  clientTools?: any[];      // Store client's tools (AG UI tools)
   threadId?: string;        // Store thread identifier
   runId?: string;           // Store run identifier
 }
@@ -252,16 +253,6 @@ export class ReactAgent implements BaseAgent {
   }
 
   private async processInputNode(state: ReactAgentState): Promise<Partial<ReactAgentState>> {
-    // Process input and prepare for model call
-    this.logger.info('Processing input', {
-      messageCount: state.messages.length,
-      iterations: state.iterations,
-      maxIterations: state.maxIterations,
-      hasClientState: !!state.clientState,
-      hasClientContext: !!state.clientContext,
-      threadId: state.threadId,
-      runId: state.runId
-    });
 
     return {
       currentStep: "processInput",
@@ -274,8 +265,73 @@ export class ReactAgent implements BaseAgent {
     };
   }
 
+  /**
+   * Implements exponential backoff retry for AWS Bedrock API calls
+   * Helps handle ThrottlingException (429) errors gracefully
+   */
+  private async callBedrockWithRetry(
+    command: ConverseStreamCommand,
+    retries: number = 3,
+    baseDelay: number = 1000
+  ): Promise<any> {
+    for (let attempt = 0; attempt < retries; attempt++) {
+      try {
+        return await this.bedrockClient.send(command);
+      } catch (error: any) {
+        const isThrottling = error?.name === 'ThrottlingException' ||
+                           error?.$metadata?.httpStatusCode === 429;
+
+        if (isThrottling && attempt < retries - 1) {
+          // Exponential backoff with jitter
+          const delay = baseDelay * Math.pow(2, attempt) + Math.random() * 1000;
+          this.logger.warn(`⏳ Throttled by AWS Bedrock, retrying in ${Math.round(delay)}ms`, {
+            attempt: attempt + 1,
+            maxRetries: retries,
+            delay: Math.round(delay),
+            errorMessage: error?.message
+          });
+
+          // Emit metric for throttling
+          const metricsEmitter = getPrometheusMetricsEmitter();
+          metricsEmitter.emitCounter('react_agent_throttling_retries_total', 1, {
+            agent_type: 'react',
+            attempt: (attempt + 1).toString()
+          });
+
+          await new Promise(resolve => setTimeout(resolve, delay));
+          continue;
+        }
+        throw error;
+      }
+    }
+    throw new Error('Failed after all retry attempts');
+  }
+
+  /**
+   * Adds progressive delay between iterations to prevent rate limiting
+   * Delay increases with iteration count to handle token accumulation
+   */
+  private async addIterationDelay(iterations: number): Promise<void> {
+    if (iterations === 0) return; // No delay on first iteration
+
+    // Progressive delay: 200ms * iteration number, capped at 2 seconds
+    // Examples: iter 1: 200ms, iter 5: 1000ms, iter 10: 2000ms
+    const delay = Math.min(200 * iterations, 2000);
+
+    this.logger.info(`⏱️ Adding iteration delay to prevent throttling`, {
+      iterations,
+      delayMs: delay,
+      reason: 'Rate limit prevention'
+    });
+
+    await new Promise(resolve => setTimeout(resolve, delay));
+  }
+
   private async callModelNode(state: ReactAgentState): Promise<Partial<ReactAgentState>> {
     const { messages, streamingCallbacks, iterations, toolResults, clientState, clientContext, threadId, runId } = state;
+
+    // Add progressive delay between iterations to prevent rate limiting
+    await this.addIterationDelay(iterations);
 
     // Log full state including client inputs
     this.logger.info('React agent full state', {
@@ -315,29 +371,15 @@ export class ReactAgent implements BaseAgent {
     const atMaxIterations = iterations >= state.maxIterations - 1;
     const shouldDisableTools = atMaxIterations;
     
-    this.logger.info('🔧 Tool configuration decision', {
-      hasToolResultsInHistory,
-      iterations,
-      maxIterations: state.maxIterations,
-      atMaxIterations,
-      shouldDisableTools,
-      toolCount: tools.length
-    });
-    
     const toolConfig = shouldDisableTools ? undefined : this.prepareToolConfig(tools);
 
-    // Build enhanced system prompt with client context
-    let enhancedSystemPrompt = this.systemPrompt;
-    if (clientState || clientContext) {
-      enhancedSystemPrompt += '\n\n## Client Context Information\n';
-      if (clientState) {
-        enhancedSystemPrompt += `\nClient State:\n${JSON.stringify(clientState, null, 2)}\n`;
-      }
-      if (clientContext && clientContext.length > 0) {
-        enhancedSystemPrompt += `\nClient Context:\n${JSON.stringify(clientContext, null, 2)}\n`;
-      }
-      enhancedSystemPrompt += '\nPlease consider the above client state and context when responding.';
-    }
+    // Build enhanced system prompt with all client data
+    const enhancedSystemPrompt = this.injectClientDataIntoPrompt(
+      this.systemPrompt,
+      clientState,
+      clientContext,
+      state.clientTools
+    );
 
     // Create the command for Bedrock ConverseStream
     const command = new ConverseStreamCommand({
@@ -374,7 +416,7 @@ export class ReactAgent implements BaseAgent {
         });
       }
 
-      const response = await this.bedrockClient.send(command);
+      const response = await this.callBedrockWithRetry(command);
       const processedResponse = await this.processStreamingResponse(response, streamingCallbacks);
       
       this.logger.info('📤 LLM Response from Bedrock', {
@@ -438,20 +480,17 @@ export class ReactAgent implements BaseAgent {
           currentStep: "callModel"
         };
       } else {
-        // Subsequent iteration with tool calls - DON'T add another assistant message
-        // The previous assistant message with tool_use is already in the history
-        // We just need to track the new tool calls to execute
-        //remove this log
+        // Subsequent iteration with tool calls - we MUST add the assistant message
+        // Each set of tool calls needs its corresponding assistant message for proper pairing
+        this.logger.info('📝 Continuation with tools: Adding assistant message with new tool calls', {
+          previousMessageCount: messages.length,
+          iterations,
+          hasToolCalls: true,
+          toolCallCount: extractedToolCalls.length
+        });
 
-        // this.logger.info('📝 Continuation with tools: NOT adding duplicate assistant message', {
-        //   previousMessageCount: messages.length,
-        //   iterations,
-        //   hasToolCalls: true,
-        //   reason: 'Previous assistant message with tool_use already exists'
-        // });
-        
         return {
-          messages: [], // Don't add any new messages, just update tool calls
+          messages: [assistantMessage], // Add the assistant message with tool calls
           toolCalls: extractedToolCalls,
           currentStep: "callModel"
         };
@@ -538,16 +577,47 @@ export class ReactAgent implements BaseAgent {
       };
     }
 
-    // Execute only new tool calls
-    for (const toolCall of newToolCalls) {
+    // Separate client tools from MCP tools
+    const clientToolCalls = newToolCalls.filter(tc => tc.toolName.startsWith('ag_ui__'));
+    const mcpToolCalls = newToolCalls.filter(tc => !tc.toolName.startsWith('ag_ui__'));
+
+    // Handle AG UI tools (client-executed)
+    if (clientToolCalls.length > 0) {
+      this.logger.info('Client tools detected - emitting events for client execution', {
+        clientToolCount: clientToolCalls.length,
+        clientTools: clientToolCalls.map(tc => tc.toolName)
+      });
+
+      // Emit events for client tools but don't wait for results
+      for (const toolCall of clientToolCalls) {
+        const { toolName, toolUseId, input } = toolCall;
+        streamingCallbacks?.onToolUseStart?.(toolName, toolUseId, input);
+
+        // The adapter will handle emitting the proper AG UI events
+        // We just need to signal that these are client tools
+      }
+
+      // For client tools, we need to return an empty tool result message
+      // This signals the completion of this request, client will send results in next request
+      return {
+        messages: [], // No new messages for client tools
+        toolCalls: [],
+        currentStep: "executeTools",
+        shouldContinue: false, // Stop here for client execution
+        iterations: state.iterations // Don't increment for client tools
+      };
+    }
+
+    // Execute MCP tools (server-executed)
+    for (const toolCall of mcpToolCalls) {
       const { toolName, toolUseId, input } = toolCall;
-      
-      this.logger.info('Tool execution started', {
+
+      this.logger.info('MCP tool execution started', {
         toolName,
         toolUseId,
         input
       });
-      
+
       streamingCallbacks?.onToolUseStart?.(toolName, toolUseId, input);
 
       try {
@@ -687,9 +757,99 @@ export class ReactAgent implements BaseAgent {
     const toolDescriptions = this.generateToolDescriptions();
     const toolValidationRules = this.getToolValidationRules();
 
+    // For initial system prompt, we don't have client data yet
+    // Client data will be injected at runtime via injectClientDataIntoPrompt
     return prompt
       .replace('{{MCP_TOOL_DESCRIPTIONS}}', toolDescriptions)
-      .replace('{{TOOL_PARAMETER_VALIDATION_RULES}}', toolValidationRules);
+      .replace('{{TOOL_PARAMETER_VALIDATION_RULES}}', toolValidationRules)
+      .replace('{{CLIENT_STATE}}', '// Client state will be injected at runtime')
+      .replace('{{CLIENT_CONTEXT}}', '// Client context will be injected at runtime')
+      .replace('{{AG_UI_TOOLS}}', '// Client tools will be injected at runtime');
+  }
+
+  private injectClientDataIntoPrompt(
+    basePrompt: string,
+    clientState?: any,
+    clientContext?: any[],
+    clientTools?: any[]
+  ): string {
+    let prompt = basePrompt;
+
+    // Inject client state with helpful usage instructions
+    if (clientState) {
+      const stateContent = `
+## Current Session State
+The following state is maintained and synchronized with the client:
+
+\`\`\`json
+${JSON.stringify(clientState, null, 2)}
+\`\`\`
+
+### How to Use State:
+- This state persists across the conversation
+- You can modify state values to track progress or store information
+- State changes will be synchronized with the client via STATE_DELTA events
+- Use state to maintain context between tool calls and responses
+- Example: Track investigation steps, store intermediate results, maintain counters
+- **Dataset**: If \`dataContext.dataset.title\` exists, use it as the index pattern for OpenSearch queries
+- **Query**: The \`query\` field contains the current PPL query shown in the UI - modify it when users request query changes
+`;
+      prompt = prompt.replace('{{CLIENT_STATE}}', stateContent);
+    } else {
+      prompt = prompt.replace('{{CLIENT_STATE}}', '// No client state provided');
+    }
+
+    // Inject client context with usage guidance
+    if (clientContext && clientContext.length > 0) {
+      const contextContent = `
+## Client Context
+Additional context provided by the client for this session:
+
+\`\`\`json
+${JSON.stringify(clientContext, null, 2)}
+\`\`\`
+
+### How to Use Context:
+- Context provides background information relevant to the current task
+- May include user preferences, environment details, or session metadata
+- Consider this context when making decisions or providing responses
+- Context is read-only and should not be modified
+`;
+      prompt = prompt.replace('{{CLIENT_CONTEXT}}', contextContent);
+    } else {
+      prompt = prompt.replace('{{CLIENT_CONTEXT}}', '// No client context provided');
+    }
+
+    // Inject AG UI tools (client-executed tools)
+    if (clientTools && clientTools.length > 0) {
+      const toolsContent = `
+## Client-Side Tools (AG UI Tools)
+These tools are executed by the client interface:
+
+${this.formatClientTools(clientTools)}
+
+### Client Tool Execution Model:
+- When you call these tools, an event is emitted to the client
+- The request completes immediately without waiting for the result
+- The client executes the tool and sends a new request with the result
+- This allows for asynchronous, non-blocking tool execution
+- Use these tools for UI interactions, state updates, and client-side operations
+`;
+      prompt = prompt.replace('{{AG_UI_TOOLS}}', toolsContent);
+    } else {
+      prompt = prompt.replace('{{AG_UI_TOOLS}}', '// No client tools provided');
+    }
+
+    return prompt;
+  }
+
+  private formatClientTools(tools: any[]): string {
+    return tools.map(tool => {
+      const params = tool.parameters ?
+        `\n  Parameters: ${JSON.stringify(tool.parameters, null, 2)}` :
+        '\n  Parameters: None';
+      return `- **${tool.name}**: ${tool.description || 'No description'}${params}`;
+    }).join('\n');
   }
 
   private getFallbackSystemPrompt(): string {
@@ -1092,30 +1252,39 @@ Example: If user says "search the osd-ops cluster", use opensearch_cluster_name:
   }
 
   private async executeToolCall(toolName: string, input: any): Promise<any> {
-    // Execute tool call through MCP (same as Jarvis)
+    // Check if this is a client tool (should not reach here)
+    if (toolName.startsWith('ag_ui__')) {
+      this.logger.warn('Client tool reached server execution - this should not happen', { toolName });
+      return {
+        error: 'Client tools should be executed by the client, not the server',
+        toolName
+      };
+    }
+
+    // Execute MCP tool call
     // Tool names come in format: serverName__toolName
     const parts = toolName.split('__');
     const serverName = parts[0];
     const actualToolName = parts.slice(1).join('__');
-    
+
     const client = this.mcpClients[serverName];
     if (!client) {
       throw new Error(`MCP server ${serverName} not found for tool ${toolName}`);
     }
-    
+
     const tools = client.getTools();
     const tool = tools.find(t => t.name === actualToolName);
     if (!tool) {
       throw new Error(`Tool ${actualToolName} not found in server ${serverName}`);
     }
-    
+
     return await client.executeTool(actualToolName, input);
   }
 
   async processMessageWithCallbacks(
     messages: any[],  // Full conversation history from UI
     callbacks: StreamingCallbacks,
-    additionalInputs?: { state?: any; context?: any[]; threadId?: string; runId?: string }
+    additionalInputs?: { state?: any; context?: any[]; tools?: any[]; threadId?: string; runId?: string }
   ): Promise<void> {
     try {
       // Set logger context for correlation with AG UI audits
@@ -1136,6 +1305,7 @@ Example: If user says "search the osd-ops cluster", use opensearch_cluster_name:
         // Add client inputs to initial state
         clientState: additionalInputs?.state,
         clientContext: additionalInputs?.context,
+        clientTools: additionalInputs?.tools,
         threadId: additionalInputs?.threadId,
         runId: additionalInputs?.runId
       };
@@ -1190,13 +1360,14 @@ Example: If user says "search the osd-ops cluster", use opensearch_cluster_name:
     await this.processMessageWithCallbacks(messages, callbacks);
   }
 
-  getAllTools(): any[] {
+  getAllTools(includeClientTools: boolean = false, clientTools?: any[]): any[] {
     // Get all tools from all MCP clients and format for Bedrock
     const allTools: any[] = [];
-    
+
+    // Add MCP server tools
     for (const [serverName, client] of Object.entries(this.mcpClients)) {
       const serverTools = client.getTools();
-      
+
       for (const tool of serverTools) {
         // Format tool for Bedrock API (matching Jarvis format)
         allTools.push({
@@ -1206,11 +1377,28 @@ Example: If user says "search the osd-ops cluster", use opensearch_cluster_name:
             inputSchema: {
               json: tool.inputSchema
             }
-          }
+          },
+          isClientTool: false  // Mark as MCP tool
         });
       }
     }
-    
+
+    // Add client tools if requested (for dual tool system)
+    if (includeClientTools && clientTools) {
+      for (const tool of clientTools) {
+        allTools.push({
+          toolSpec: {
+            name: `ag_ui__${tool.name}`,  // Prefix with ag_ui to distinguish
+            description: tool.description || `Client tool: ${tool.name}`,
+            inputSchema: {
+              json: tool.parameters || {}
+            }
+          },
+          isClientTool: true  // Mark as client tool
+        });
+      }
+    }
+
     return allTools;
   }
 

@@ -568,6 +568,7 @@ export class BaseAGUIAdapter {
         await this.agent.processMessageWithCallbacks(messages, callbacks, {
           state: fullInput?.state,
           context: fullInput?.context,
+          tools: fullInput?.tools,  // Pass client tools from AG UI
           threadId: fullInput?.threadId,
           runId: fullInput?.runId
         });

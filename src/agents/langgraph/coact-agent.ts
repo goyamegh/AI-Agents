@@ -297,16 +297,6 @@ export class CoActAgent implements BaseAgent {
   }
 
   private async processInputNode(state: CoActAgentState): Promise<Partial<CoActAgentState>> {
-    // Process input and prepare for model call
-    this.logger.info('Processing input', {
-      messageCount: state.messages.length,
-      iterations: state.iterations,
-      maxIterations: state.maxIterations,
-      hasClientState: !!state.clientState,
-      hasClientContext: !!state.clientContext,
-      threadId: state.threadId,
-      runId: state.runId
-    });
 
     return {
       currentStep: "processInput",

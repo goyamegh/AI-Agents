@@ -4,7 +4,7 @@ import * as fs from 'fs';
 import * as path from 'path';
 import * as readline from 'readline';
 import * as dotenv from 'dotenv';
-import { format } from 'date-fns';
+import { format, parse, isValid } from 'date-fns';
 
 dotenv.config({ path: path.join(__dirname, '..', '.env') });
 
@@ -35,10 +35,11 @@ interface MetricEntry {
 class OpenSearchIngestor {
   private client: Client;
   private batchSize: number = 100;
+  private batchDelay: number = 500; // Delay in ms between batches
   private processedFiles: Set<string> = new Set();
   private stateFile: string;
 
-  constructor() {
+  constructor(options?: { batchSize?: number; batchDelay?: number }) {
     const opensearchUrl = process.env.EXTERNAL_OPENSEARCH_URL;
     const username = process.env.EXTERNAL_OPENSEARCH_USERNAME;
     const password = process.env.EXTERNAL_OPENSEARCH_PASSWORD;
@@ -46,6 +47,16 @@ class OpenSearchIngestor {
     if (!opensearchUrl || !username || !password) {
       throw new Error('OpenSearch credentials not found in .env file');
     }
+
+    // Apply custom options if provided
+    if (options?.batchSize) {
+      this.batchSize = options.batchSize;
+    }
+    if (options?.batchDelay !== undefined) {
+      this.batchDelay = options.batchDelay;
+    }
+
+    console.log(`Configuration: batchSize=${this.batchSize}, batchDelay=${this.batchDelay}ms`);
 
     this.client = new Client({
       node: opensearchUrl,
@@ -304,6 +315,11 @@ class OpenSearchIngestor {
         if (batch.length >= this.batchSize) {
           await this.bulkIndex(batch, indexName);
           batch = [];
+
+          // Add delay between batches to avoid overwhelming OpenSearch
+          if (this.batchDelay > 0) {
+            await new Promise(resolve => setTimeout(resolve, this.batchDelay));
+          }
         }
       }
     }
@@ -318,7 +334,7 @@ class OpenSearchIngestor {
     console.log(`Completed processing ${filePath}`);
   }
 
-  private async bulkIndex(entries: any[], indexName: string): Promise<void> {
+  private async bulkIndex(entries: any[], indexName: string, retries: number = 3): Promise<void> {
     if (entries.length === 0) return;
 
     const body = entries.flatMap(doc => [
@@ -326,15 +342,73 @@ class OpenSearchIngestor {
       doc
     ]);
 
-    try {
-      const response = await this.client.bulk({ body });
-      if (response.body.errors) {
-        console.error('Bulk indexing errors:', JSON.stringify(response.body.errors));
-      } else {
-        console.log(`Successfully indexed ${entries.length} documents to ${indexName}`);
+    for (let attempt = 1; attempt <= retries; attempt++) {
+      try {
+        const response = await this.client.bulk({ body });
+
+        if (response.body.errors) {
+          // Extract failed documents for retry
+          const failedDocs: any[] = [];
+          const successfulDocs: number[] = [];
+
+          response.body.items.forEach((item: any, index: number) => {
+            if (item.index && item.index.error) {
+              console.error(`Document ${index} failed:`, item.index.error);
+              failedDocs.push(entries[index]);
+            } else {
+              successfulDocs.push(index);
+            }
+          });
+
+          console.log(`Successfully indexed ${successfulDocs.length}/${entries.length} documents to ${indexName}`);
+
+          // Retry failed documents if any
+          if (failedDocs.length > 0 && attempt < retries) {
+            console.log(`Retrying ${failedDocs.length} failed documents (attempt ${attempt + 1}/${retries})...`);
+            await new Promise(resolve => setTimeout(resolve, 1000 * attempt)); // Exponential backoff
+            entries = failedDocs; // Update entries for next retry
+            continue;
+          } else if (failedDocs.length > 0) {
+            console.error(`Failed to index ${failedDocs.length} documents after ${retries} attempts`);
+            // Optionally save failed documents to a file for manual recovery
+            this.saveFailedDocuments(failedDocs, indexName);
+          }
+        } else {
+          console.log(`Successfully indexed ${entries.length} documents to ${indexName}`);
+        }
+
+        return; // Success, exit the retry loop
+
+      } catch (error: any) {
+        console.error(`Bulk indexing attempt ${attempt}/${retries} failed:`, error.message);
+
+        if (attempt < retries) {
+          const backoffTime = 1000 * attempt; // Exponential backoff
+          console.log(`Waiting ${backoffTime}ms before retry...`);
+          await new Promise(resolve => setTimeout(resolve, backoffTime));
+        } else {
+          console.error(`Failed to index batch after ${retries} attempts`);
+          // Save failed documents for manual recovery
+          this.saveFailedDocuments(entries, indexName);
+        }
       }
+    }
+  }
+
+  private saveFailedDocuments(docs: any[], indexName: string): void {
+    try {
+      const failedDir = path.join(__dirname, '..', 'failed-indexing');
+      if (!fs.existsSync(failedDir)) {
+        fs.mkdirSync(failedDir, { recursive: true });
+      }
+
+      const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
+      const filename = path.join(failedDir, `failed-${indexName}-${timestamp}.json`);
+
+      fs.writeFileSync(filename, JSON.stringify({ index: indexName, documents: docs }, null, 2));
+      console.log(`Saved ${docs.length} failed documents to ${filename} for manual recovery`);
     } catch (error) {
-      console.error('Error during bulk indexing:', error);
+      console.error('Failed to save failed documents:', error);
     }
   }
 
@@ -425,10 +499,46 @@ class OpenSearchIngestor {
 
 // Main execution
 async function main() {
-  const ingestor = new OpenSearchIngestor();
-
   const args = process.argv.slice(2);
   const watchMode = args.includes('--watch') || args.includes('-w');
+
+  // Parse command line options
+  let batchSize: number | undefined;
+  let batchDelay: number | undefined;
+
+  const batchSizeIndex = args.findIndex(arg => arg.startsWith('--batch-size='));
+  if (batchSizeIndex !== -1) {
+    batchSize = parseInt(args[batchSizeIndex].split('=')[1], 10);
+  }
+
+  const batchDelayIndex = args.findIndex(arg => arg.startsWith('--batch-delay='));
+  if (batchDelayIndex !== -1) {
+    batchDelay = parseInt(args[batchDelayIndex].split('=')[1], 10);
+  }
+
+  // Show help if requested
+  if (args.includes('--help') || args.includes('-h')) {
+    console.log(`
+OpenSearch Ingestion Tool
+
+Usage: npm run opensearch:ingest [options]
+
+Options:
+  --watch, -w           Watch mode - continuously monitor for new files
+  --batch-size=N        Number of documents per batch (default: 100)
+  --batch-delay=N       Delay in milliseconds between batches (default: 500)
+  --help, -h            Show this help message
+
+Examples:
+  npm run opensearch:ingest                          # One-time ingestion with defaults
+  npm run opensearch:ingest --batch-size=50          # Smaller batches
+  npm run opensearch:ingest --batch-delay=1000       # 1 second delay between batches
+  npm run opensearch:watch --batch-size=25 --batch-delay=2000  # Watch mode with custom settings
+    `);
+    process.exit(0);
+  }
+
+  const ingestor = new OpenSearchIngestor({ batchSize, batchDelay });
 
   try {
     if (watchMode) {

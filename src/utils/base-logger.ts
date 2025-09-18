@@ -49,7 +49,7 @@ export abstract class BaseLogger {
    * Convert Unix timestamp to human-readable format in PDT
    */
   protected toHumanTimestamp(unixTimestamp: number): string {
-    return new Date(unixTimestamp).toLocaleString('en-US', {
+    const dateStr = new Date(unixTimestamp).toLocaleString('en-US', {
       year: 'numeric',
       month: 'short',
       day: '2-digit',
@@ -60,6 +60,10 @@ export abstract class BaseLogger {
       timeZone: 'America/Los_Angeles',
       timeZoneName: 'short'
     });
+
+    // Fix potential hour 24 issue (some locales may show midnight as 24:00)
+    // Replace 24:xx:xx with 00:xx:xx
+    return dateStr.replace(/\b24:(\d{2}:\d{2})\b/, '00:$1');
   }
 
   /**
