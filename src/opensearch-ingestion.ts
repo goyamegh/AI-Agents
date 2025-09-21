@@ -403,7 +403,7 @@ class OpenSearchIngestor {
       }
 
       const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
-      const filename = path.join(failedDir, `failed-${indexName}-${timestamp}.json`);
+      const filename = path.join(failedDir, `failed-indexing-${indexName}-${timestamp}.json`);
 
       fs.writeFileSync(filename, JSON.stringify({ index: indexName, documents: docs }, null, 2));
       console.log(`Saved ${docs.length} failed documents to ${filename} for manual recovery`);

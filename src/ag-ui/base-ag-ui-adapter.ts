@@ -54,6 +54,8 @@ export class BaseAGUIAdapter {
 
   // State management for AG UI events
   private stateHistory: State[] = [];
+  // Accumulate state deltas during message streaming
+  private pendingStateDeltas: any[] = [];
 
   constructor(
     agent: BaseAgent,
@@ -237,25 +239,7 @@ export class BaseAGUIAdapter {
         input.runId,
         input  // Pass the full input
       );
-
-      // Emit thinking end after agent reasoning
-      // observer.next({
-      //   type: EventType.THINKING_TEXT_MESSAGE_END,
-      //   timestamp: Date.now()
-      // });
-
-      // observer.next({
-      //   type: EventType.THINKING_END,
-      //   timestamp: Date.now()
-      // } as ThinkingEndEvent);
-
-      // Don't emit STEP_FINISHED for agent_processing - we removed the corresponding STEP_STARTED
-      // this.emitAndAuditEvent({
-      //   type: EventType.STEP_FINISHED,
-      //   stepName: `${agentType}_agent_processing`,
-      //   timestamp: Date.now()
-      // } as StepFinishedEvent, observer, input.threadId, input.runId);
-
+      
       // Emit text message end FIRST to close the message stream
       this.emitAndAuditEvent(
         {
@@ -324,6 +308,74 @@ export class BaseAGUIAdapter {
   }
 
   /**
+   * Detect and parse PPL query from text content
+   */
+  private detectPPLQuery(text: string): any | null {
+    try {
+      // Check for STATE_DELTA JSON block with PPL query
+      const stateDeltaMatch = text.match(/\{\s*"type"\s*:\s*"STATE_DELTA"[\s\S]*?"ppl_query"[\s\S]*?\}[\s\S]*?\}/);
+      if (stateDeltaMatch) {
+        // Extract the JSON object
+        const jsonStr = stateDeltaMatch[0];
+        const parsed = JSON.parse(jsonStr);
+        if (parsed.delta?.ppl_query) {
+          this.logger.info('PPL query detected in STATE_DELTA format', {
+            query: parsed.delta.ppl_query.query,
+            dataset: parsed.delta.ppl_query.dataset
+          });
+          return parsed.delta.ppl_query;
+        }
+      }
+
+      // Alternative: Check for PPL query in code blocks
+      const pplBlockMatch = text.match(/```ppl\s*([\s\S]*?)```/i);
+      if (pplBlockMatch) {
+        const query = pplBlockMatch[1].trim();
+        if (query) {
+          this.logger.info('PPL query detected in code block', { query });
+          // Try to extract dataset from query (source=dataset pattern)
+          const datasetMatch = query.match(/source\s*=\s*([^\s|]+)/);
+          const dataset = datasetMatch ? datasetMatch[1] : 'unknown';
+
+          return {
+            query: query,
+            description: 'PPL query from code block',
+            dataset: dataset,
+            timestamp: new Date().toISOString()
+          };
+        }
+      }
+
+      // Check for inline PPL patterns
+      const inlinePatterns = [
+        /source\s*=\s*[^\s|]+.*?\|.*?(?:where|stats|fields|sort|head|tail)/i,
+        /search\s+source\s*=\s*[^\s|]+/i
+      ];
+
+      for (const pattern of inlinePatterns) {
+        const match = text.match(pattern);
+        if (match) {
+          const query = match[0];
+          const datasetMatch = query.match(/source\s*=\s*([^\s|]+)/);
+          const dataset = datasetMatch ? datasetMatch[1] : 'unknown';
+
+          this.logger.info('Inline PPL query detected', { query, dataset });
+          return {
+            query: query,
+            description: 'Inline PPL query',
+            dataset: dataset,
+            timestamp: new Date().toISOString()
+          };
+        }
+      }
+    } catch (error) {
+      this.logger.debug('Error detecting PPL query', { error: error.message });
+    }
+
+    return null;
+  }
+
+  /**
    * Run agent with streaming content emission through observer
    */
   private async runAgentWithStreamingEvents(
@@ -335,10 +387,14 @@ export class BaseAGUIAdapter {
     fullInput?: RunAgentInput  // Add parameter for full input
   ): Promise<void> {
     const agentType = this.agent.getAgentType();
+    // Track accumulated text to detect multi-line PPL queries
+    let accumulatedText = '';
+
     try {
       // Create callbacks to convert agent events to AG UI events
       const callbacks: StreamingCallbacks = {
         onTextStart: (text: string) => {
+          accumulatedText = text; // Start accumulating text
           this.emitAndAuditEvent(
             {
               type: EventType.TEXT_MESSAGE_CONTENT,
@@ -352,6 +408,28 @@ export class BaseAGUIAdapter {
           );
         },
         onTextDelta: (delta: string) => {
+          accumulatedText += delta; // Continue accumulating text
+
+          // Check for PPL query in accumulated text (for multi-line queries)
+          const pplQuery = this.detectPPLQuery(accumulatedText);
+          if (pplQuery) {
+            // Check if we already have this query in pending deltas
+            const existingQuery = this.pendingStateDeltas.find(
+              d => d.ppl_query?.query === pplQuery.query
+            );
+
+            if (!existingQuery) {
+              // Add to pending state deltas
+              this.pendingStateDeltas.push({
+                ppl_query: pplQuery
+              });
+              this.logger.info('PPL query added to pending state deltas', {
+                query: pplQuery.query,
+                pendingCount: this.pendingStateDeltas.length
+              });
+            }
+          }
+
           this.emitAndAuditEvent(
             {
               type: EventType.TEXT_MESSAGE_CONTENT,
@@ -412,13 +490,18 @@ export class BaseAGUIAdapter {
             runId
           );
 
-          // Also add a text message for visibility in the chat
-          // this.emitAndAuditEvent({
-          //   type: EventType.TEXT_MESSAGE_CONTENT,
-          //   messageId,
-          //   delta: `\n\n🔧 Using tool: ${actualToolName}`,
-          //   timestamp: Date.now()
-          // } as TextMessageContentEvent, observer, threadId, runId);
+          // Emit TOOL_CALL_END event FIRST
+          this.emitAndAuditEvent(
+            {
+              type: EventType.TOOL_CALL_END,
+              toolCallId: toolUseId,
+              timestamp: Date.now(),
+            } as ToolCallEndEvent,
+            observer,
+            threadId,
+            runId
+          );
+
         },
         onToolResult: (toolName: string, toolUseId: string, result: any) => {
           const actualToolName = toolName.split("__")[1] || toolName;
@@ -543,7 +626,33 @@ export class BaseAGUIAdapter {
           );
         },
         onTurnComplete: () => {
-          // Turn completed - the calling method will handle message end events
+          // Turn completed - emit any pending state deltas before message ends
+          if (this.pendingStateDeltas.length > 0) {
+            this.logger.info('Emitting pending STATE_DELTA events', {
+              count: this.pendingStateDeltas.length
+            });
+
+            // Combine all pending deltas into one
+            const combinedDelta: any = {};
+            for (const delta of this.pendingStateDeltas) {
+              Object.assign(combinedDelta, delta);
+            }
+
+            // Emit STATE_DELTA event
+            this.emitAndAuditEvent(
+              {
+                type: EventType.STATE_DELTA,
+                delta: combinedDelta,
+                timestamp: Date.now(),
+              } as StateDeltaEvent,
+              observer,
+              threadId,
+              runId
+            );
+
+            // Clear pending deltas
+            this.pendingStateDeltas = [];
+          }
         },
         onError: (error: string) => {
           // Emit error as text content
@@ -564,13 +673,15 @@ export class BaseAGUIAdapter {
       // Use agent's callback-based processing
       // Pass the messages array directly as the first parameter
       // Pass additional inputs if agent supports it (check parameter count)
+      // Extract modelId from forwardedProps if it exists
       if (this.agent.processMessageWithCallbacks.length >= 3) {
         await this.agent.processMessageWithCallbacks(messages, callbacks, {
           state: fullInput?.state,
           context: fullInput?.context,
           tools: fullInput?.tools,  // Pass client tools from AG UI
           threadId: fullInput?.threadId,
-          runId: fullInput?.runId
+          runId: fullInput?.runId,
+          modelId: fullInput?.forwardedProps?.modelId  // Extract modelId from forwardedProps
         });
       } else {
         await this.agent.processMessageWithCallbacks(messages, callbacks);
