@@ -564,13 +564,15 @@ export class BaseAGUIAdapter {
       // Use agent's callback-based processing
       // Pass the messages array directly as the first parameter
       // Pass additional inputs if agent supports it (check parameter count)
+      // Extract modelId from forwardedProps if it exists
       if (this.agent.processMessageWithCallbacks.length >= 3) {
         await this.agent.processMessageWithCallbacks(messages, callbacks, {
           state: fullInput?.state,
           context: fullInput?.context,
           tools: fullInput?.tools,  // Pass client tools from AG UI
           threadId: fullInput?.threadId,
-          runId: fullInput?.runId
+          runId: fullInput?.runId,
+          modelId: fullInput?.forwardedProps?.modelId  // Extract modelId from forwardedProps
         });
       } else {
         await this.agent.processMessageWithCallbacks(messages, callbacks);

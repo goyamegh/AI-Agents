@@ -6,6 +6,7 @@ import { MCPServerConfig } from '../../types/mcp-types';
 import { Logger } from '../../utils/logger';
 import { BaseAgent, StreamingCallbacks } from '../base-agent';
 import { truncateToolResult } from '../../utils/truncate-tool-result';
+import { ModelConfigManager } from '../../config/model-config';
 
 export class JarvisAgent implements BaseAgent {
   private bedrockClient: BedrockRuntimeClient;
@@ -301,32 +302,46 @@ Remember: Tool parameter validation errors should trigger immediate self-correct
   /**
    * Public method to process a user message with custom callbacks
    */
-  async processMessageWithCallbacks(userMessage: string, callbacks: StreamingCallbacks, conversationHistory?: any[]): Promise<void> {
-    this.logger.info('Processing message with callbacks', { message: userMessage });
+  async processMessageWithCallbacks(
+    userMessage: string | any[],
+    callbacks: StreamingCallbacks,
+    additionalInputs?: { state?: any; context?: any[]; tools?: any[]; threadId?: string; runId?: string; modelId?: string }
+  ): Promise<void> {
+    // Handle both old signature (string) and new signature (messages array)
+    const conversationHistory = Array.isArray(userMessage) ? userMessage : undefined;
+    const modelId = additionalInputs?.modelId;
+
+    this.logger.info('Processing message with callbacks', {
+      isArray: Array.isArray(userMessage),
+      modelId
+    });
 
     // For server mode (with callbacks), use passed conversation history as-is
     // For CLI mode (no callbacks), manage local history
     if (callbacks && conversationHistory) {
       // Server mode: completely stateless, use client's history
-      await this.processConversationTurn(callbacks, conversationHistory);
-    } else {
+      await this.processConversationTurn(callbacks, conversationHistory, modelId);
+    } else if (typeof userMessage === 'string') {
       // CLI mode: manage local history
       const userMsg: any = {
         role: 'user',
         content: [{ text: userMessage }]
       };
       this.cliConversationHistory.push(userMsg);
-      await this.processConversationTurn(callbacks, this.cliConversationHistory);
+      await this.processConversationTurn(callbacks, this.cliConversationHistory, modelId);
     }
   }
 
-  private async processConversationTurn(callbacks?: StreamingCallbacks, conversationHistory: any[] = []): Promise<void> {
+  private async processConversationTurn(callbacks?: StreamingCallbacks, conversationHistory: any[] = [], requestModelId?: string): Promise<void> {
     const tools = this.getAllTools();
     this.logger.debug('Available tools for request', { toolCount: tools.length });
 
+    // Resolve model ID using priority: request -> default -> hardcoded
+    const modelId = ModelConfigManager.resolveModelId(requestModelId);
+
     try {
       const command = new ConverseStreamCommand({
-        modelId: 'us.anthropic.claude-sonnet-4-20250514-v1:0',
+        modelId: modelId,
         system: [{ text: this.systemPrompt }],
         messages: conversationHistory,
         toolConfig: tools.length > 0 ? { tools: tools } : undefined,
@@ -337,7 +352,7 @@ Remember: Tool parameter validation errors should trigger immediate self-correct
       });
 
       this.logger.debug('Sending request to Bedrock', {
-        modelId: 'us.anthropic.claude-sonnet-4-20250514-v1:0',
+        modelId: modelId,
         messageCount: conversationHistory.length,
         toolCount: tools.length
       });

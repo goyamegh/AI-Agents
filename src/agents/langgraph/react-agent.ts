@@ -12,6 +12,7 @@ import readline from 'readline';
 import { v4 as uuidv4 } from 'uuid';
 import { getPrometheusMetricsEmitter } from '../../utils/metrics-emitter';
 import { truncateToolResult } from '../../utils/truncate-tool-result';
+import { ModelConfigManager } from '../../config/model-config';
 
 // Configuration constants
 const REACT_MAX_ITERATIONS = 10; // Maximum tool execution cycles before forcing final response
@@ -33,6 +34,7 @@ export interface ReactAgentState {
   clientTools?: any[];      // Store client's tools (AG UI tools)
   threadId?: string;        // Store thread identifier
   runId?: string;           // Store run identifier
+  modelId?: string;         // Store model identifier from forwardedProps for dynamic model selection
 }
 
 /**
@@ -58,9 +60,11 @@ export class ReactAgent implements BaseAgent {
   constructor(logger?: Logger) {
     this.logger = logger || new Logger();
     const region = process.env.AWS_REGION || 'us-east-1';
-    
+
     this.bedrockClient = new BedrockRuntimeClient({
-      region: region
+      region: region,
+      // Let our custom retry logic handle throttling with better logging
+      maxAttempts: 1  // Disable SDK retries, use our callBedrockWithRetry instead
     });
     
     this.logger.info('ReAct Agent initialized', {
@@ -271,24 +275,35 @@ export class ReactAgent implements BaseAgent {
    */
   private async callBedrockWithRetry(
     command: ConverseStreamCommand,
-    retries: number = 3,
-    baseDelay: number = 1000
+    retries: number = 5,  // Increased from 3 to 5 for better resilience
+    baseDelay: number = 2000  // Increased from 1000ms to 2000ms base delay
   ): Promise<any> {
     for (let attempt = 0; attempt < retries; attempt++) {
       try {
+        // Log retry attempts in a friendly way
+        if (attempt > 0) {
+          this.logger.info(`🔄 Retry attempt ${attempt}/${retries - 1}`, {
+            attempt: attempt + 1,
+            maxRetries: retries
+          });
+        }
+
         return await this.bedrockClient.send(command);
       } catch (error: any) {
         const isThrottling = error?.name === 'ThrottlingException' ||
-                           error?.$metadata?.httpStatusCode === 429;
+                           error?.$metadata?.httpStatusCode === 429 ||
+                           error?.message?.includes('Too many tokens');
 
         if (isThrottling && attempt < retries - 1) {
-          // Exponential backoff with jitter
-          const delay = baseDelay * Math.pow(2, attempt) + Math.random() * 1000;
-          this.logger.warn(`⏳ Throttled by AWS Bedrock, retrying in ${Math.round(delay)}ms`, {
-            attempt: attempt + 1,
-            maxRetries: retries,
-            delay: Math.round(delay),
-            errorMessage: error?.message
+          // Enhanced exponential backoff with jitter
+          // Delays: ~2-3s, ~4-5s, ~8-9s, ~16-17s, ~32-33s
+          const exponentialDelay = baseDelay * Math.pow(2, attempt);
+          const jitter = Math.random() * 1000;
+          const delay = exponentialDelay + jitter;
+
+          // Friendly short info about retry
+          this.logger.info(`⏳ Rate limited - waiting ${Math.round(delay/1000)}s before retry ${attempt + 1}/${retries - 1}`, {
+            delaySeconds: Math.round(delay/1000)
           });
 
           // Emit metric for throttling
@@ -301,6 +316,16 @@ export class ReactAgent implements BaseAgent {
           await new Promise(resolve => setTimeout(resolve, delay));
           continue;
         }
+
+        // Log the final error if all retries are exhausted
+        if (isThrottling) {
+          this.logger.error('All retry attempts exhausted for throttling error', {
+            attempts: retries,
+            errorMessage: error?.message,
+            requestId: error?.$metadata?.requestId
+          });
+        }
+
         throw error;
       }
     }
@@ -314,21 +339,19 @@ export class ReactAgent implements BaseAgent {
   private async addIterationDelay(iterations: number): Promise<void> {
     if (iterations === 0) return; // No delay on first iteration
 
-    // Progressive delay: 200ms * iteration number, capped at 2 seconds
-    // Examples: iter 1: 200ms, iter 5: 1000ms, iter 10: 2000ms
-    const delay = Math.min(200 * iterations, 2000);
+    // Progressive delay: 500ms * iteration number, capped at 5 seconds
+    // Examples: iter 1: 500ms, iter 5: 2500ms, iter 10: 5000ms
+    const delay = Math.min(500 * iterations, 5000);
 
-    this.logger.info(`⏱️ Adding iteration delay to prevent throttling`, {
-      iterations,
-      delayMs: delay,
-      reason: 'Rate limit prevention'
+    this.logger.info(`⏱️ Pacing request (iteration ${iterations})`, {
+      delaySeconds: (delay / 1000).toFixed(1)
     });
 
     await new Promise(resolve => setTimeout(resolve, delay));
   }
 
   private async callModelNode(state: ReactAgentState): Promise<Partial<ReactAgentState>> {
-    const { messages, streamingCallbacks, iterations, toolResults, clientState, clientContext, threadId, runId } = state;
+    const { messages, streamingCallbacks, iterations, toolResults, clientState, clientContext, threadId, runId, modelId } = state;
 
     // Add progressive delay between iterations to prevent rate limiting
     await this.addIterationDelay(iterations);
@@ -381,9 +404,12 @@ export class ReactAgent implements BaseAgent {
       state.clientTools
     );
 
+    // Resolve model ID using priority: request -> default -> hardcoded
+    const resolvedModelId = ModelConfigManager.resolveModelId(modelId);
+
     // Create the command for Bedrock ConverseStream
     const command = new ConverseStreamCommand({
-      modelId: "us.anthropic.claude-sonnet-4-20250514-v1:0",
+      modelId: resolvedModelId,
       messages: bedrockMessages,
       system: [{ text: enhancedSystemPrompt }],
       toolConfig: toolConfig,
@@ -516,11 +542,19 @@ export class ReactAgent implements BaseAgent {
           currentStep: "callModel"
         };
       }
-      
-      // Return error message to streaming callbacks
-      const errorMessage = error?.message || error?.name || String(error) || 'Unknown error occurred';
-      streamingCallbacks?.onError?.(errorMessage);
-      
+
+      // Check if this was a throttling error that exhausted all retries
+      const isThrottling = error?.name === 'ThrottlingException' ||
+                         error?.$metadata?.httpStatusCode === 429 ||
+                         error?.message?.includes('Too many tokens');
+
+      // Provide appropriate error message to user
+      const userErrorMessage = isThrottling
+        ? 'The AI service is currently experiencing high demand. Please wait a moment and try again.'
+        : (error?.message || error?.name || String(error) || 'Unknown error occurred');
+
+      streamingCallbacks?.onError?.(userErrorMessage);
+
       return {
         shouldContinue: false,
         currentStep: "callModel"
@@ -1284,7 +1318,7 @@ Example: If user says "search the osd-ops cluster", use opensearch_cluster_name:
   async processMessageWithCallbacks(
     messages: any[],  // Full conversation history from UI
     callbacks: StreamingCallbacks,
-    additionalInputs?: { state?: any; context?: any[]; tools?: any[]; threadId?: string; runId?: string }
+    additionalInputs?: { state?: any; context?: any[]; tools?: any[]; threadId?: string; runId?: string; modelId?: string }
   ): Promise<void> {
     try {
       // Set logger context for correlation with AG UI audits
@@ -1307,7 +1341,8 @@ Example: If user says "search the osd-ops cluster", use opensearch_cluster_name:
         clientContext: additionalInputs?.context,
         clientTools: additionalInputs?.tools,
         threadId: additionalInputs?.threadId,
-        runId: additionalInputs?.runId
+        runId: additionalInputs?.runId,
+        modelId: additionalInputs?.modelId
       };
 
       // Run the graph - unique config per request for stateless operation

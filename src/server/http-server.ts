@@ -5,6 +5,7 @@ import { Logger } from '../utils/logger';
 import { AGUIAuditLogger } from '../utils/ag-ui-audit-logger';
 import { BaseAGUIAdapter, BaseAGUIConfig } from '../ag-ui/base-ag-ui-adapter';
 import { RunAgentInput, BaseEvent, EventType, RunErrorEvent, RunFinishedEvent } from '@ag-ui/core';
+import { ModelConfigManager } from '../config/model-config';
 
 export class HTTPServer {
   private app: express.Application;
@@ -84,6 +85,36 @@ export class HTTPServer {
       } catch (error) {
         const errorMessage = error instanceof Error ? error.message : String(error);
         this.logger.error('Error getting tools', { error: errorMessage });
+        res.status(500).json({ error: errorMessage });
+      }
+    });
+
+    // Model configuration endpoints
+    this.app.get('/api/model/default', (req, res) => {
+      try {
+        const modelConfig = ModelConfigManager.getDefaultModel();
+        res.json(modelConfig);
+      } catch (error) {
+        const errorMessage = error instanceof Error ? error.message : String(error);
+        this.logger.error('Error getting default model', { error: errorMessage });
+        res.status(500).json({ error: errorMessage });
+      }
+    });
+
+    this.app.put('/api/model/default', (req, res) => {
+      try {
+        const { modelId } = req.body;
+
+        if (!modelId || typeof modelId !== 'string') {
+          res.status(400).json({ error: 'modelId must be a non-empty string' });
+          return;
+        }
+
+        ModelConfigManager.setDefaultModel(modelId);
+        res.json({ modelId, message: 'Default model updated successfully' });
+      } catch (error) {
+        const errorMessage = error instanceof Error ? error.message : String(error);
+        this.logger.error('Error setting default model', { error: errorMessage });
         res.status(500).json({ error: errorMessage });
       }
     });

@@ -12,6 +12,7 @@ import readline from 'readline';
 import { v4 as uuidv4 } from 'uuid';
 import { getPrometheusMetricsEmitter } from '../../utils/metrics-emitter';
 import { truncateToolResult } from '../../utils/truncate-tool-result';
+import { ModelConfigManager } from '../../config/model-config';
 
 // Configuration constants
 const COACT_MAX_ITERATIONS = 10; // Maximum tool execution cycles before forcing final response
@@ -65,6 +66,7 @@ export interface CoActAgentState {
   clientContext?: any[];    // Store client's context array
   threadId?: string;        // Store thread identifier
   runId?: string;           // Store run identifier
+  modelId?: string;         // Store model identifier from forwardedProps for dynamic model selection
 }
 
 /**
@@ -450,7 +452,7 @@ Remember: Output ONLY the JSON object, no additional text.`;
   }
 
   private async callModelNode(state: CoActAgentState): Promise<Partial<CoActAgentState>> {
-    const { messages, streamingCallbacks, iterations, toolResults, clientState, clientContext, threadId, runId } = state;
+    const { messages, streamingCallbacks, iterations, toolResults, clientState, clientContext, threadId, runId, modelId } = state;
 
     // Log full state including client inputs
     this.logger.info('CoAct agent full state', {
@@ -514,9 +516,12 @@ Remember: Output ONLY the JSON object, no additional text.`;
       enhancedSystemPrompt += '\nPlease consider the above client state and context when responding.';
     }
 
+    // Resolve model ID using priority: request -> default -> hardcoded
+    const resolvedModelId = ModelConfigManager.resolveModelId(modelId);
+
     // Create the command for Bedrock ConverseStream
     const command = new ConverseStreamCommand({
-      modelId: "us.anthropic.claude-sonnet-4-20250514-v1:0",
+      modelId: resolvedModelId,
       messages: bedrockMessages,
       system: [{ text: enhancedSystemPrompt }],
       toolConfig: toolConfig,
@@ -1350,7 +1355,7 @@ ${JSON.stringify(results, null, 2)}`;
   async processMessageWithCallbacks(
     messages: any[],  // Full conversation history from UI
     callbacks: StreamingCallbacks,
-    additionalInputs?: { state?: any; context?: any[]; threadId?: string; runId?: string }
+    additionalInputs?: { state?: any; context?: any[]; tools?: any[]; threadId?: string; runId?: string; modelId?: string }
   ): Promise<void> {
     try {
       // Set logger context for correlation with AG UI audits
@@ -1387,7 +1392,8 @@ ${JSON.stringify(results, null, 2)}`;
         clientState: additionalInputs?.state,
         clientContext: additionalInputs?.context,
         threadId: additionalInputs?.threadId,
-        runId: additionalInputs?.runId
+        runId: additionalInputs?.runId,
+        modelId: additionalInputs?.modelId
       };
 
       // Run the graph - unique config per request for stateless operation
