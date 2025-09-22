@@ -1,18 +1,16 @@
-import { BedrockRuntimeClient, ConverseStreamCommand } from "@aws-sdk/client-bedrock-runtime";
-import { StateGraph, START, END } from "@langchain/langgraph";
-import { SqliteSaver } from "@langchain/langgraph-checkpoint-sqlite";
-import { BaseMessage, HumanMessage, AIMessage, SystemMessage } from "@langchain/core/messages";
-import { readFileSync, existsSync, mkdirSync } from 'fs';
-import { join, dirname } from 'path';
-import { BaseMCPClient, LocalMCPClient, HTTPMCPClient } from '../../mcp/index';
-import { MCPServerConfig } from '../../types/mcp-types';
-import { Logger } from '../../utils/logger';
-import { BaseAgent, StreamingCallbacks } from '../base-agent';
-import readline from 'readline';
-import { v4 as uuidv4 } from 'uuid';
-import { getPrometheusMetricsEmitter } from '../../utils/metrics-emitter';
-import { truncateToolResult } from '../../utils/truncate-tool-result';
-import { ModelConfigManager } from '../../config/model-config';
+import { BaseMCPClient, LocalMCPClient, HTTPMCPClient } from "../../mcp/index";
+import { MCPServerConfig } from "../../types/mcp-types";
+import { Logger } from "../../utils/logger";
+import { BaseAgent, StreamingCallbacks } from "../base-agent";
+import readline from "readline";
+import { LLMRequestLogger } from "../../utils/llm-request-logger";
+import { BedrockClient } from "./bedrock-client";
+import { PromptManager } from "./prompt-manager";
+import { ReactGraphBuilder } from "./react-graph-builder";
+import { ToolExecutor } from "./tool-executor";
+import { ReactGraphNodes } from "./react-graph-nodes";
+import { BedrockRuntimeClient } from "@aws-sdk/client-bedrock-runtime";
+import { StateGraph } from "@langchain/langgraph";
 
 // Configuration constants
 const REACT_MAX_ITERATIONS = 10; // Maximum tool execution cycles before forcing final response
@@ -29,1306 +27,159 @@ export interface ReactAgentState {
   streamingCallbacks?: StreamingCallbacks;
   lastToolExecution?: number; // Timestamp of last tool execution
   // Client-provided inputs from AG UI
-  clientState?: any;        // Store client's state object
-  clientContext?: any[];    // Store client's context array
-  clientTools?: any[];      // Store client's tools (AG UI tools)
-  threadId?: string;        // Store thread identifier
-  runId?: string;           // Store run identifier
-  modelId?: string;         // Store model identifier from forwardedProps for dynamic model selection
+  clientState?: any; // Store client's state object
+  clientContext?: any[]; // Store client's context array
+  clientTools?: any[]; // Store client's tools (AG UI tools)
+  threadId?: string; // Store thread identifier
+  runId?: string; // Store run identifier
+  modelId?: string; // Store model identifier from forwardedProps for dynamic model selection
 }
 
 /**
  * ReAct Agent Implementation
- * 
+ *
  * This agent implements the ReAct (Reasoning + Acting) pattern using LangGraph's StateGraph:
  * - AWS Bedrock ConverseStream API (same as Jarvis Agent)
  * - MCP tool infrastructure
  * - System prompts
  * - Streaming callbacks
- * 
+ *
  * The key difference is the graph-based state management and workflow orchestration
  */
 export class ReactAgent implements BaseAgent {
-  private bedrockClient: BedrockRuntimeClient;
   private mcpClients: Record<string, BaseMCPClient> = {};
-  private systemPrompt: string = '';
   private logger: Logger;
-  private graph?: StateGraph<ReactAgentState>;
+  private llmLogger: LLMRequestLogger;
   private compiledGraph?: any;
   private rl?: readline.Interface;
 
+  // Component instances
+  private bedrockClient: BedrockClient;
+  private promptManager: PromptManager;
+  private graphBuilder: ReactGraphBuilder;
+  private toolExecutor: ToolExecutor;
+  private graphNodes: ReactGraphNodes;
+
   constructor(logger?: Logger) {
     this.logger = logger || new Logger();
-    const region = process.env.AWS_REGION || 'us-east-1';
+    this.llmLogger = LLMRequestLogger.getInstance();
 
-    this.bedrockClient = new BedrockRuntimeClient({
-      region: region,
-      // Let our custom retry logic handle throttling with better logging
-      maxAttempts: 1  // Disable SDK retries, use our callBedrockWithRetry instead
-    });
-    
-    this.logger.info('ReAct Agent initialized', {
-      region: region,
-      hasAwsAccessKey: !!process.env.AWS_ACCESS_KEY_ID,
-      hasAwsSecretKey: !!process.env.AWS_SECRET_ACCESS_KEY,
-      hasAwsProfile: !!process.env.AWS_PROFILE,
-      hasAwsSessionToken: !!process.env.AWS_SESSION_TOKEN
-    });
+    // Initialize components
+    this.bedrockClient = new BedrockClient(this.logger);
+    this.promptManager = new PromptManager(this.logger, this.mcpClients);
+    this.graphBuilder = new ReactGraphBuilder(this.logger);
+    this.toolExecutor = new ToolExecutor(this.logger, this.mcpClients, this.llmLogger);
+    this.graphNodes = new ReactGraphNodes(
+      this.logger,
+      this.llmLogger,
+      this.bedrockClient,
+      this.promptManager,
+      this.toolExecutor
+    );
+
+    this.logger.info("ReAct Agent initialized with component architecture");
   }
 
   getAgentType(): string {
-    return 'react';
+    return "react";
   }
 
   async initialize(
-    configs: Record<string, MCPServerConfig>, 
+    configs: Record<string, MCPServerConfig>,
     customSystemPrompt?: string
   ): Promise<void> {
-    this.logger.info('Initializing ReAct Agent', {
+    this.logger.info("Initializing ReAct Agent", {
       serverCount: Object.keys(configs).length,
-      servers: Object.keys(configs)
+      servers: Object.keys(configs),
     });
 
     // Connect to all MCP servers (reuse existing infrastructure)
     for (const [name, config] of Object.entries(configs)) {
       this.logger.info(`Connecting to MCP server: ${name}`);
-      
+
       // Create appropriate client based on config type
       let client: BaseMCPClient;
-      if (config.type === 'http') {
+      if (config.type === "http") {
         client = new HTTPMCPClient(config, name, this.logger);
       } else {
         client = new LocalMCPClient(config, name, this.logger);
       }
-      
+
       await client.connect();
       this.mcpClients[name] = client;
-      
+
       const tools = client.getTools();
-      this.logger.info(`Connected to ${name}, available tools: ${tools.length}`);
+      this.logger.info(
+        `Connected to ${name}, available tools: ${tools.length}`
+      );
     }
+
+    // Update prompt manager with connected MCP clients
+    this.promptManager = new PromptManager(this.logger, this.mcpClients);
+    this.toolExecutor = new ToolExecutor(this.logger, this.mcpClients, this.llmLogger);
+
+    // Update graph nodes with new tool executor
+    this.graphNodes = new ReactGraphNodes(
+      this.logger,
+      this.llmLogger,
+      this.bedrockClient,
+      this.promptManager,
+      this.toolExecutor
+    );
 
     // Load system prompt - now that MCP clients are connected, we can generate dynamic prompt
-    if (customSystemPrompt) {
-      this.systemPrompt = this.enhanceSystemPrompt(customSystemPrompt);
-      this.logger.info('Using enhanced custom system prompt with dynamic content', {
-        customPromptLength: customSystemPrompt.length,
-        finalPromptLength: this.systemPrompt.length,
-        customPromptPreview: customSystemPrompt.substring(0, 200) + '...'
-      });
-    } else {
-      // Always use dynamic system prompt that describes actual MCP tools
-      this.systemPrompt = this.getDefaultSystemPrompt();
-      this.logger.info('Using dynamic system prompt with MCP tools', {
-        promptLength: this.systemPrompt.length,
-        connectedServers: Object.keys(this.mcpClients).length,
-        promptPreview: this.systemPrompt.substring(0, 200) + '...'
-      });
-    }
+    this.promptManager.loadSystemPrompt(customSystemPrompt);
 
     this.buildStateGraph();
-    
-    this.logger.info('ReAct Agent initialization complete', {
-      totalTools: this.getAllTools().length
+
+    this.logger.info("ReAct Agent initialization complete", {
+      totalTools: this.getAllTools().length,
     });
   }
 
   private buildStateGraph(): void {
-    // Create state graph with channels
-    this.graph = new StateGraph<ReactAgentState>({
-      channels: {
-        messages: {
-          value: (x: any[], y: any[]) => [...x, ...y],
-          default: () => []
-        },
-        currentStep: {
-          value: (x: string, y: string) => y || x,
-          default: () => "processInput"
-        },
-        // TODO: Test whether we need to accumulate tool calls or just replace
-        toolCalls: {
-          value: (x: any[], y: any[]) => y,  // Replace instead of accumulate
-          default: () => []
-        },
-        toolResults: {
-          value: (x: any, y: any) => ({ ...x, ...y }),
-          default: () => ({})
-        },
-        iterations: {
-          value: (x: number, y: number) => y,
-          default: () => 0
-        },
-        maxIterations: {
-          value: (x: number, y: number) => y || x,
-          default: () => REACT_MAX_ITERATIONS
-        },
-        shouldContinue: {
-          value: (x: boolean, y: boolean) => y,
-          default: () => true
-        },
-        streamingCallbacks: {
-          value: (x: any, y: any) => y || x,
-          default: () => undefined
-        },
-        // Client-provided inputs - preserve throughout graph execution
-        clientState: {
-          value: (x: any, y: any) => y || x,
-          default: () => undefined
-        },
-        clientContext: {
-          value: (x: any[], y: any[]) => y || x,
-          default: () => undefined
-        },
-        threadId: {
-          value: (x: string, y: string) => y || x,
-          default: () => undefined
-        },
-        runId: {
-          value: (x: string, y: string) => y || x,
-          default: () => undefined
-        }
-      }
-    });
-
-    // Add nodes (avoiding reserved names)
-    this.graph.addNode("processInput", this.processInputNode.bind(this));
-    this.graph.addNode("callModel", this.callModelNode.bind(this));
-    this.graph.addNode("executeTools", this.executeToolsNode.bind(this));
-    this.graph.addNode("generateResponse", this.generateResponseNode.bind(this));
-
-    // Add edges
-    this.graph.addEdge(START as "__start__", "processInput" as "__end__");
-    this.graph.addEdge("processInput" as "__start__", "callModel" as "__end__");
-    
-    // Conditional edge from callModel
-    this.graph.addConditionalEdges(
-      "callModel" as any,
-      (state: ReactAgentState) => {
-        // Log the decision for debugging
-        // this.logger.info('🔄 Graph Decision: callModel -> next node', {
-        //   toolCallsCount: state.toolCalls.length,
-        //   hasToolCalls: state.toolCalls.length > 0,
-        //   iterations: state.iterations,
-        //   maxIterations: state.maxIterations,
-        //   messageCount: state.messages.length,
-        //   lastMessageRole: state.messages[state.messages.length - 1]?.role,
-        //   nextNode: state.toolCalls.length > 0 ? "executeTools" : "generateResponse"
-        // });
-        
-        if (state.toolCalls.length > 0) {
-          return "executeTools";
-        }
-        return "generateResponse";
-      }
+    this.compiledGraph = this.graphBuilder.buildStateGraph(
+      this.graphNodes.processInputNode.bind(this.graphNodes),
+      this.graphNodes.callModelNode.bind(this.graphNodes),
+      this.graphNodes.executeToolsNode.bind(this.graphNodes),
+      this.graphNodes.generateResponseNode.bind(this.graphNodes)
     );
-
-    // Edge from executeTools back to callModel or to response
-    this.graph.addConditionalEdges(
-      "executeTools" as "__start__",
-      (state: ReactAgentState) => {
-        const shouldContinue = state.iterations < state.maxIterations && state.shouldContinue;
-        
-        // Log the decision for debugging
-        this.logger.info('🔄 Graph Decision: executeTools -> next node', {
-          iterations: state.iterations,
-          maxIterations: state.maxIterations,
-          shouldContinue: state.shouldContinue,
-          willContinue: shouldContinue,
-          messageCount: state.messages.length,
-          lastMessageRole: state.messages[state.messages.length - 1]?.role,
-          hasToolResults: Object.keys(state.toolResults).length > 0,
-          nextNode: shouldContinue ? "callModel" : "generateResponse"
-        });
-        
-        if (shouldContinue) {
-          return "callModel";
-        }
-        return "generateResponse";
-      }
-    );
-
-    this.graph.addEdge("generateResponse" as "__start__", END as "__end__");
-
-    // Compile the graph with SQLite checkpointer for memory persistence
-    // Use in-memory SQLite database (no setup required)
-    const checkpointer = SqliteSaver.fromConnString(":memory:");
-    
-    this.compiledGraph = this.graph.compile({ checkpointer });
   }
 
-  private async processInputNode(state: ReactAgentState): Promise<Partial<ReactAgentState>> {
 
-    return {
-      currentStep: "processInput",
-      // Preserve client inputs for downstream nodes
-      clientState: state.clientState,
-      clientContext: state.clientContext,
-      threadId: state.threadId,
-      runId: state.runId
-      // Don't increment iterations here - only increment after tool execution
-    };
-  }
 
-  /**
-   * Implements exponential backoff retry for AWS Bedrock API calls
-   * Helps handle ThrottlingException (429) errors gracefully
-   */
-  private async callBedrockWithRetry(
-    command: ConverseStreamCommand,
-    retries: number = 5,  // Increased from 3 to 5 for better resilience
-    baseDelay: number = 2000  // Increased from 1000ms to 2000ms base delay
-  ): Promise<any> {
-    for (let attempt = 0; attempt < retries; attempt++) {
-      try {
-        // Log retry attempts in a friendly way
-        if (attempt > 0) {
-          this.logger.info(`🔄 Retry attempt ${attempt}/${retries - 1}`, {
-            attempt: attempt + 1,
-            maxRetries: retries
-          });
-        }
 
-        return await this.bedrockClient.send(command);
-      } catch (error: any) {
-        const isThrottling = error?.name === 'ThrottlingException' ||
-                           error?.$metadata?.httpStatusCode === 429 ||
-                           error?.message?.includes('Too many tokens');
-
-        if (isThrottling && attempt < retries - 1) {
-          // Enhanced exponential backoff with jitter
-          // Delays: ~2-3s, ~4-5s, ~8-9s, ~16-17s, ~32-33s
-          const exponentialDelay = baseDelay * Math.pow(2, attempt);
-          const jitter = Math.random() * 1000;
-          const delay = exponentialDelay + jitter;
-
-          // Friendly short info about retry
-          this.logger.info(`⏳ Rate limited - waiting ${Math.round(delay/1000)}s before retry ${attempt + 1}/${retries - 1}`, {
-            delaySeconds: Math.round(delay/1000)
-          });
-
-          // Emit metric for throttling
-          const metricsEmitter = getPrometheusMetricsEmitter();
-          metricsEmitter.emitCounter('react_agent_throttling_retries_total', 1, {
-            agent_type: 'react',
-            attempt: (attempt + 1).toString()
-          });
-
-          await new Promise(resolve => setTimeout(resolve, delay));
-          continue;
-        }
-
-        // Log the final error if all retries are exhausted
-        if (isThrottling) {
-          this.logger.error('All retry attempts exhausted for throttling error', {
-            attempts: retries,
-            errorMessage: error?.message,
-            requestId: error?.$metadata?.requestId
-          });
-        }
-
-        throw error;
-      }
-    }
-    throw new Error('Failed after all retry attempts');
-  }
-
-  /**
-   * Adds progressive delay between iterations to prevent rate limiting
-   * Delay increases with iteration count to handle token accumulation
-   */
-  private async addIterationDelay(iterations: number): Promise<void> {
-    if (iterations === 0) return; // No delay on first iteration
-
-    // Progressive delay: 500ms * iteration number, capped at 5 seconds
-    // Examples: iter 1: 500ms, iter 5: 2500ms, iter 10: 5000ms
-    const delay = Math.min(500 * iterations, 5000);
-
-    this.logger.info(`⏱️ Pacing request (iteration ${iterations})`, {
-      delaySeconds: (delay / 1000).toFixed(1)
-    });
-
-    await new Promise(resolve => setTimeout(resolve, delay));
-  }
-
-  private async callModelNode(state: ReactAgentState): Promise<Partial<ReactAgentState>> {
-    const { messages, streamingCallbacks, iterations, toolResults, clientState, clientContext, threadId, runId, modelId } = state;
-
-    // Add progressive delay between iterations to prevent rate limiting
-    await this.addIterationDelay(iterations);
-
-    // Log full state including client inputs
-    this.logger.info('React agent full state', {
-      clientState,
-      clientContext,
-      threadId,
-      runId,
-      iterations,
-      maxIterations: state.maxIterations,
-      messageCount: messages.length,
-      hasToolResults: Object.keys(toolResults).length > 0
-    });
-        
-    this.logger.info('📥 callModelNode: Starting', {
-      iterations,
-      maxIterations: state.maxIterations,
-      messageCount: messages.length,
-      lastMessageRole: messages[messages.length - 1]?.role,
-      lastMessageContent: messages[messages.length - 1]?.content ? 
-        JSON.stringify(messages[messages.length - 1].content).substring(0, 100) : 'undefined'
-    });
-    
-    // Prepare messages for Bedrock (same as Jarvis)
-    const bedrockMessages = this.prepareMessagesForBedrock(messages);
-    
-    // Get available tools - but don't provide tools if we're at max iterations (to force a final response)
-    const tools = this.getAllTools();
-    
-    // Check if there are tool results in the message history (properly formatted)
-    const hasToolResultsInHistory = messages.some(msg => 
-      Array.isArray(msg.content) && 
-      msg.content.some((c: any) => c.toolResult !== undefined)
-    );
-    
-    // Only disable tools if we're at max iterations to force a final response
-    // Let the model decide if it needs more tools based on the conversation context
-    const atMaxIterations = iterations >= state.maxIterations - 1;
-    const shouldDisableTools = atMaxIterations;
-    
-    const toolConfig = shouldDisableTools ? undefined : this.prepareToolConfig(tools);
-
-    // Build enhanced system prompt with all client data
-    const enhancedSystemPrompt = this.injectClientDataIntoPrompt(
-      this.systemPrompt,
-      clientState,
-      clientContext,
-      state.clientTools
-    );
-
-    // Resolve model ID using priority: request -> default -> hardcoded
-    const resolvedModelId = ModelConfigManager.resolveModelId(modelId);
-
-    // Create the command for Bedrock ConverseStream
-    const command = new ConverseStreamCommand({
-      modelId: resolvedModelId,
-      messages: bedrockMessages,
-      system: [{ text: enhancedSystemPrompt }],
-      toolConfig: toolConfig,
-      inferenceConfig: {
-        maxTokens: 4096,
-        temperature: 0,
-      }
-    });
-
-    try {
-      // Log the actual messages being sent with full detail
-      this.logger.info('LLM Request Messages ', {
-        messageCount: bedrockMessages.length,
-        messages: bedrockMessages
-      });
-
-      // Emit warning and metric if we're forcing a final response due to max iterations
-      if (atMaxIterations) {
-        this.logger.warn('MAX_ITERATIONS_REACHED: Forcing final response from LLM', {
-          iterations,
-          maxIterations: state.maxIterations,
-          messageCount: bedrockMessages.length
-        });
-        
-        // Emit Prometheus metric
-        const metricsEmitter = getPrometheusMetricsEmitter();
-        metricsEmitter.emitCounter('react_agent_max_iterations_reached_total', 1, {
-          agent_type: 'react',
-          max_iterations: state.maxIterations.toString()
-        });
-      }
-
-      const response = await this.callBedrockWithRetry(command);
-      const processedResponse = await this.processStreamingResponse(response, streamingCallbacks);
-      
-      this.logger.info('📤 LLM Response from Bedrock', {
-        contentBlocksCount: processedResponse.message.content.length,
-        contentBlocks: processedResponse
-      });
-
-      // Check if the response contains XML tool calls in the text (fallback for when Bedrock doesn't recognize tools)
-      let extractedToolCalls = processedResponse.toolCalls || [];
-      let assistantMessage = processedResponse.message; // Use the complete message from Bedrock
-      
-      if (extractedToolCalls.length === 0 && processedResponse.message.textContent.includes('<function_calls>')) {
-        this.logger.warn('Tool calls found in text content, attempting to parse XML');
-        extractedToolCalls = this.parseToolCallsFromXML(processedResponse.message.textContent);
-        
-        // For XML tool calls, we need to handle them differently
-        // Remove the XML from the text content
-        if (extractedToolCalls.length > 0) {
-          const xmlStart = processedResponse.message.textContent.indexOf('<function_calls>');
-          const xmlEnd = processedResponse.message.textContent.indexOf('</function_calls>') + '</function_calls>'.length;
-          const cleanedText = processedResponse.message.textContent.substring(0, xmlStart).trim();
-          
-          // Update the assistant message to remove XML from text blocks
-          assistantMessage = {
-            role: 'assistant',
-            content: cleanedText ? [{ text: cleanedText }] : []
-          };
-        }
-      }
-      
-      // Handle message history properly based on UML diagram flow
-      // First iteration: Add assistant message with tool calls
-      // Subsequent iterations: Only add assistant message if there are no tool calls (final response)
-      
-      const isFirstCallInTurn = iterations === 0;
-      
-      if (isFirstCallInTurn) {
-        // First call in this turn - add only the new assistant message
-        // this.logger.info('📝 First iteration: Adding initial assistant message', {
-        //   previousMessageCount: messages.length,
-        //   iterations,
-        //   hasToolCalls: extractedToolCalls.length > 0
-        // });
-        
-        return {
-          messages: [assistantMessage], // Only return the new message, StateGraph will append it
-          toolCalls: extractedToolCalls,
-          currentStep: "callModel"
-        };
-      } else if (extractedToolCalls.length === 0) {
-        // Subsequent iteration with no tool calls - this is the final response
-        this.logger.info('📝 Final response: Adding assistant message without tool calls', {
-          previousMessageCount: messages.length,
-          iterations,
-          hasToolCalls: false
-        });
-        
-        return {
-          messages: [assistantMessage], // Only return the new message, StateGraph will append it
-          toolCalls: extractedToolCalls,
-          currentStep: "callModel"
-        };
-      } else {
-        // Subsequent iteration with tool calls - we MUST add the assistant message
-        // Each set of tool calls needs its corresponding assistant message for proper pairing
-        this.logger.info('📝 Continuation with tools: Adding assistant message with new tool calls', {
-          previousMessageCount: messages.length,
-          iterations,
-          hasToolCalls: true,
-          toolCallCount: extractedToolCalls.length
-        });
-
-        return {
-          messages: [assistantMessage], // Add the assistant message with tool calls
-          toolCalls: extractedToolCalls,
-          currentStep: "callModel"
-        };
-      }
-    } catch (error) {
-      // Enhanced error logging to capture all error details
-      this.logger.error('Error calling model', { 
-        error,
-        errorName: error?.name,
-        errorMessage: error?.message,
-        errorStack: error?.stack,
-        errorCode: error?.code,
-        errorType: typeof error,
-        errorKeys: error ? Object.keys(error) : [],
-        errorString: String(error)
-      });
-
-      // Handle credential expiration
-      if (error?.name === 'ExpiredTokenException' || error?.name === 'CredentialsProviderError') {
-        streamingCallbacks?.onError?.('AWS credentials expired. Please refresh your credentials and try again.');
-        return {
-          shouldContinue: false,
-          currentStep: "callModel"
-        };
-      }
-
-      // Check if this was a throttling error that exhausted all retries
-      const isThrottling = error?.name === 'ThrottlingException' ||
-                         error?.$metadata?.httpStatusCode === 429 ||
-                         error?.message?.includes('Too many tokens');
-
-      // Provide appropriate error message to user
-      const userErrorMessage = isThrottling
-        ? 'The AI service is currently experiencing high demand. Please wait a moment and try again.'
-        : (error?.message || error?.name || String(error) || 'Unknown error occurred');
-
-      streamingCallbacks?.onError?.(userErrorMessage);
-
-      return {
-        shouldContinue: false,
-        currentStep: "callModel"
-      };
-    }
-  }
-
-  private async executeToolsNode(state: ReactAgentState): Promise<Partial<ReactAgentState>> {
-    const { toolCalls, streamingCallbacks, messages, clientState, clientContext, threadId, runId } = state;
-    const toolResults: Record<string, any> = {};
-
-    this.logger.info('Executing tools', {
-      toolCallsCount: toolCalls.length,
-      toolNames: toolCalls.map(tc => tc.toolName),
-      toolIds: toolCalls.map(tc => tc.toolUseId),
-      currentIterations: state.iterations,
-      maxIterations: state.maxIterations
-    });
-
-    // Check if we've already executed these exact tool calls to prevent duplicates
-    // We need to check if there are corresponding toolResult blocks for these toolUse blocks
-    const toolCallSignatures = toolCalls.map(tc => tc.toolUseId);
-
-    // Look for tool results in user messages (these indicate executed tools)
-    const previouslyExecutedToolIds = messages
-      .filter(m => m.role === 'user')
-      .flatMap(m => Array.isArray(m.content) ? m.content : [])
-      .filter((c: any) => c.toolResult)
-      .map((c: any) => c.toolResult.toolUseId);
-
-    const newToolCalls = toolCalls.filter(tc => 
-      !previouslyExecutedToolIds.includes(tc.toolUseId)
-    );
-
-    if (newToolCalls.length === 0 && toolCalls.length > 0) {
-      this.logger.warn('All tool calls have already been executed, skipping redundant execution', {
-        attemptedToolCallIds: toolCallSignatures,
-        previouslyExecutedToolIds,
-        iterations: state.iterations
-      });
-      
-      // Emit Prometheus metric for redundant tool call attempts
-      const metricsEmitter = getPrometheusMetricsEmitter();
-      metricsEmitter.emitCounter('react_agent_redundant_tool_calls_total', toolCalls.length, {
-        agent_type: 'react',
-        iteration: state.iterations.toString()
-      });
-      
-      return {
-        messages: [], // Don't modify messages in this case, let the existing flow handle it
-        toolCalls: [],
-        shouldContinue: false,
-        currentStep: "executeTools"
-      };
-    }
-
-    // Separate client tools from MCP tools
-    const clientToolCalls = newToolCalls.filter(tc => tc.toolName.startsWith('ag_ui__'));
-    const mcpToolCalls = newToolCalls.filter(tc => !tc.toolName.startsWith('ag_ui__'));
-
-    // Handle AG UI tools (client-executed)
-    if (clientToolCalls.length > 0) {
-      this.logger.info('Client tools detected - emitting events for client execution', {
-        clientToolCount: clientToolCalls.length,
-        clientTools: clientToolCalls.map(tc => tc.toolName)
-      });
-
-      // Emit events for client tools but don't wait for results
-      for (const toolCall of clientToolCalls) {
-        const { toolName, toolUseId, input } = toolCall;
-        streamingCallbacks?.onToolUseStart?.(toolName, toolUseId, input);
-
-        // The adapter will handle emitting the proper AG UI events
-        // We just need to signal that these are client tools
-      }
-
-      // For client tools, we need to return an empty tool result message
-      // This signals the completion of this request, client will send results in next request
-      return {
-        messages: [], // No new messages for client tools
-        toolCalls: [],
-        currentStep: "executeTools",
-        shouldContinue: false, // Stop here for client execution
-        iterations: state.iterations // Don't increment for client tools
-      };
-    }
-
-    // Execute MCP tools (server-executed)
-    for (const toolCall of mcpToolCalls) {
-      const { toolName, toolUseId, input } = toolCall;
-
-      this.logger.info('MCP tool execution started', {
-        toolName,
-        toolUseId,
-        input
-      });
-
-      streamingCallbacks?.onToolUseStart?.(toolName, toolUseId, input);
-
-      try {
-        // Pass client context along with tool execution
-        const enhancedInput = {
-          ...input,
-          _clientContext: {
-            state: clientState,
-            context: clientContext,
-            threadId: threadId,
-            runId: runId
-          }
-        };
-        const result = await this.executeToolCall(toolName, enhancedInput);
-        toolResults[toolUseId] = result;
-        
-        this.logger.info('Tool execution completed', {
-          toolName,
-          toolUseId,
-          resultType: typeof result,
-          resultKeys: result && typeof result === 'object' ? Object.keys(result) : [],
-          resultLength: typeof result === 'string' ? result.length : undefined
-        });
-        
-        streamingCallbacks?.onToolResult?.(toolName, toolUseId, result);
-      } catch (error) {
-        const errorMessage = error instanceof Error ? error.message : String(error);
-        
-        this.logger.error('Tool execution failed', {
-          toolName,
-          toolUseId,
-          error: errorMessage,
-          input
-        });
-        
-        streamingCallbacks?.onToolError?.(toolName, toolUseId, errorMessage);
-        toolResults[toolUseId] = { error: errorMessage };
-      }
-    }
-
-    const newIterations = state.iterations + 1;
-    const willContinue = newIterations < state.maxIterations && state.shouldContinue;
-
-    this.logger.info('All tools executed', {
-      toolResultsCount: Object.keys(toolResults).length,
-      successfulTools: Object.entries(toolResults).filter(([, result]) => !result.error).length,
-      failedTools: Object.entries(toolResults).filter(([, result]) => result.error).length,
-      previousIterations: state.iterations,
-      newIterations: newIterations,
-      maxIterations: state.maxIterations,
-      shouldContinue: state.shouldContinue,
-      willContinue: willContinue
-    });
-
-    // Add tool results to the message history for the model to see
-    // The assistant message with toolUse blocks should already be in the messages array
-    // We just need to add the user message with toolResult blocks
-    
-    // Create user message with tool result blocks for all executed tools
-    // CRITICAL: Ensure content array is not empty
-    const toolResultContent = newToolCalls.map(tc => {
-      // Truncate tool result to prevent API input size errors
-      const truncatedResult = truncateToolResult(toolResults[tc.toolUseId] || { error: 'No result found' });
-      return {
-        toolResult: {
-          toolUseId: tc.toolUseId,
-          content: [{ text: truncatedResult }]
-        }
-      };
-    });
-    
-    // Only create the message if we have tool results
-    if (toolResultContent.length === 0) {
-      this.logger.warn('No tool results to send back to model');
-      return {
-        toolCalls: [],
-        currentStep: "executeTools",
-        shouldContinue: false
-      };
-    }
-    
-    const toolResultMessage = {
-      role: 'user' as const,
-      content: toolResultContent
-    };
-
-    // Emit metric for iteration count
-    const metricsEmitter = getPrometheusMetricsEmitter();
-    metricsEmitter.emitHistogram('react_agent_iterations_per_request', newIterations, {
-      agent_type: 'react'
-    });
-
-    // Note: The assistant message with toolUse blocks is already in messages from callModelNode
-    // We only need to add the toolResult message
-    return {
-      messages: [toolResultMessage], // Only return the new message, StateGraph will append it
-      toolResults: { ...state.toolResults, ...toolResults },
-      toolCalls: [], // Clear tool calls after execution
-      currentStep: "executeTools",
-      iterations: newIterations, // Set the new iterations count
-      shouldContinue: true, // Keep this true to allow the graph to decide
-      lastToolExecution: Date.now() // Track when tools were last executed
-    };
-  }
-
-  private async generateResponseNode(state: ReactAgentState): Promise<Partial<ReactAgentState>> {
-    const { streamingCallbacks, messages, iterations } = state;
-    streamingCallbacks?.onTurnComplete?.();
-    
-    return {
-      currentStep: "generateResponse",
-      shouldContinue: false
-    };
-  }
-
-  private getDefaultSystemPrompt(): string {
-    // Load AI agent template and inject dynamic MCP tool information
-    const aiAgentPromptPath = join(__dirname, '../../prompts/claudecode.md');
-
-    if (!existsSync(aiAgentPromptPath)) {
-      this.logger.warn('claudecode.md not found, falling back to basic prompt');
-      return this.getFallbackSystemPrompt();
-    }
-
-    try {
-      let aiAgentPrompt = readFileSync(aiAgentPromptPath, 'utf-8');
-      return this.enhanceSystemPrompt(aiAgentPrompt);
-    } catch (error) {
-      const errorMessage = error instanceof Error ? error.message : String(error);
-      this.logger.error('Failed to load claudecode.md', { error: errorMessage });
-      return this.getFallbackSystemPrompt();
-    }
-  }
-
-  private enhanceSystemPrompt(prompt: string): string {
-    // Replace template placeholders with dynamic content
-    const toolDescriptions = this.generateToolDescriptions();
-    const toolValidationRules = this.getToolValidationRules();
-
-    // For initial system prompt, we don't have client data yet
-    // Client data will be injected at runtime via injectClientDataIntoPrompt
-    return prompt
-      .replace('{{MCP_TOOL_DESCRIPTIONS}}', toolDescriptions)
-      .replace('{{TOOL_PARAMETER_VALIDATION_RULES}}', toolValidationRules)
-      .replace('{{CLIENT_STATE}}', '// Client state will be injected at runtime')
-      .replace('{{CLIENT_CONTEXT}}', '// Client context will be injected at runtime')
-      .replace('{{AG_UI_TOOLS}}', '// Client tools will be injected at runtime');
-  }
-
-  private injectClientDataIntoPrompt(
-    basePrompt: string,
-    clientState?: any,
-    clientContext?: any[],
-    clientTools?: any[]
-  ): string {
-    let prompt = basePrompt;
-
-    // Inject client state with helpful usage instructions
-    if (clientState) {
-      const stateContent = `
-## Current Session State
-The following state is maintained and synchronized with the client:
-
-\`\`\`json
-${JSON.stringify(clientState, null, 2)}
-\`\`\`
-
-### How to Use State:
-- This state persists across the conversation
-- You can modify state values to track progress or store information
-- State changes will be synchronized with the client via STATE_DELTA events
-- Use state to maintain context between tool calls and responses
-- Example: Track investigation steps, store intermediate results, maintain counters
-- **Dataset**: If \`dataContext.dataset.title\` exists, use it as the index pattern for OpenSearch queries
-- **Query**: The \`query\` field contains the current PPL query shown in the UI - modify it when users request query changes
-`;
-      prompt = prompt.replace('{{CLIENT_STATE}}', stateContent);
-    } else {
-      prompt = prompt.replace('{{CLIENT_STATE}}', '// No client state provided');
-    }
-
-    // Inject client context with usage guidance
-    if (clientContext && clientContext.length > 0) {
-      const contextContent = `
-## Client Context
-Additional context provided by the client for this session:
-
-\`\`\`json
-${JSON.stringify(clientContext, null, 2)}
-\`\`\`
-
-### How to Use Context:
-- Context provides background information relevant to the current task
-- May include user preferences, environment details, or session metadata
-- Consider this context when making decisions or providing responses
-- Context is read-only and should not be modified
-`;
-      prompt = prompt.replace('{{CLIENT_CONTEXT}}', contextContent);
-    } else {
-      prompt = prompt.replace('{{CLIENT_CONTEXT}}', '// No client context provided');
-    }
-
-    // Inject AG UI tools (client-executed tools)
-    if (clientTools && clientTools.length > 0) {
-      const toolsContent = `
-## Client-Side Tools (AG UI Tools)
-These tools are executed by the client interface:
-
-${this.formatClientTools(clientTools)}
-
-### Client Tool Execution Model:
-- When you call these tools, an event is emitted to the client
-- The request completes immediately without waiting for the result
-- The client executes the tool and sends a new request with the result
-- This allows for asynchronous, non-blocking tool execution
-- Use these tools for UI interactions, state updates, and client-side operations
-`;
-      prompt = prompt.replace('{{AG_UI_TOOLS}}', toolsContent);
-    } else {
-      prompt = prompt.replace('{{AG_UI_TOOLS}}', '// No client tools provided');
-    }
-
-    return prompt;
-  }
-
-  private formatClientTools(tools: any[]): string {
-    return tools.map(tool => {
-      const params = tool.parameters ?
-        `\n  Parameters: ${JSON.stringify(tool.parameters, null, 2)}` :
-        '\n  Parameters: None';
-      return `- **${tool.name}**: ${tool.description || 'No description'}${params}`;
-    }).join('\n');
-  }
-
-  private getFallbackSystemPrompt(): string {
-    // Fallback prompt if claudecode.md cannot be loaded
-    const toolDescriptions = this.generateToolDescriptions();
-    const openSearchContext = this.getOpenSearchClusterContext();
-
-    return `You are ReAct Agent, an AI assistant specialized in helping with software engineering tasks using the ReAct (Reasoning + Acting) pattern.
-
-You have access to the following tools through MCP (Model Context Protocol) servers:
-
-${toolDescriptions}
-
-${openSearchContext}
-
-Key behaviors:
-- Be concise and direct
-- Focus on the specific task at hand
-- Use available tools when appropriate
-- Provide clear, actionable responses
-- When asked about your tools, list ONLY the MCP tools shown above
-
-${this.getToolValidationRules()}`;
-  }
-
-  private getToolValidationRules(): string {
-    return `
-CRITICAL: Tool Parameter Validation and Self-Correction
-
-When using tools, you MUST follow this validation process:
-
-1. ANALYZE TOOL SCHEMA: Before calling any tool, carefully examine its description and parameter requirements
-   - Pay special attention to REQUIRED PARAMETERS listed in the tool description
-   - Review parameter types and constraints
-   - Ensure you understand what each parameter expects
-
-2. PARAMETER VALIDATION: Before making a tool call, verify:
-   - All required parameters are provided
-   - Parameter values are in the correct format
-   - No required parameters are null, undefined, or empty
-
-3. SELF-CORRECTION FLOW: If a tool call fails due to parameter validation:
-   - Immediately analyze the error message to identify missing or incorrect parameters
-   - Review the tool's parameter requirements again
-   - Ask the user for clarification if needed parameter values are not available in the context
-   - Retry the tool call with the correct parameters
-   - Do NOT make the same parameter mistake twice
-
-4. MULTI-TURN CORRECTION: For complex tool interactions:
-   - If you receive an error about missing parameters
-   - Stop and identify what information you need
-   - Either extract the required information from context or ask the user
-   - Retry with complete parameter set
-
-Example self-correction pattern:
-- Tool call fails: "Missing required parameter: path"
-- Response: "I need to provide the path parameter. Let me ask you for the file path or search for it in the context."
-- Retry with correct parameters
-
-Remember: Tool parameter validation errors should trigger immediate self-correction, not repeated failures.`;
-  }
-
-  private generateToolDescriptions(): string {
-    if (Object.keys(this.mcpClients).length === 0) {
-      return "No MCP tools currently available.";
-    }
-
-    const descriptions: string[] = [];
-
-    for (const [serverName, client] of Object.entries(this.mcpClients)) {
-      const serverTools = client.getTools();
-      if (serverTools.length > 0) {
-        descriptions.push(`## ${serverName} server tools:`);
-
-        for (const tool of serverTools) {
-          let toolDescription = `- **${tool.name}**: ${tool.description || 'No description available'}`;
-
-          if (tool.inputSchema.required && tool.inputSchema.required.length > 0) {
-            toolDescription += `\n  - Required parameters: ${tool.inputSchema.required.join(', ')}`;
-          }
-
-          descriptions.push(toolDescription);
-        }
-        descriptions.push(''); // Add blank line between servers
-      }
-    }
-
-    return descriptions.join('\n');
-  }
-
-  private getOpenSearchClusterContext(): string {
-    // Check if OpenSearch MCP server is connected
-    if (!this.mcpClients['opensearch-mcp-server']) {
-      return '';
-    }
-
-    try {
-      const clusters = this.getAvailableOpenSearchClusters();
-      if (clusters.length === 0) {
-        return '';
-      }
-
-      const clusterInfo = clusters.map(cluster => `- ${cluster}`).join('\n');
-
-      return `
-OPENSEARCH CLUSTER INFORMATION:
-You have access to OpenSearch clusters through the opensearch-mcp-server. Available clusters:
-${clusterInfo}
-
-IMPORTANT: When using OpenSearch tools, you MUST specify which cluster to use with the opensearch_cluster_name parameter.
-- If the user mentions a specific cluster name, use that cluster
-- If the user has previously specified a cluster in this conversation, continue using that cluster unless told otherwise
-- If no cluster is specified, ask the user which cluster they want to use
-- Remember the cluster selection throughout the conversation for consistency
-
-Example: If user says "search the osd-ops cluster", use opensearch_cluster_name: "osd-ops" for subsequent OpenSearch operations.`;
-    } catch (error) {
-      this.logger.debug('Could not get OpenSearch cluster context', { error });
-      return '';
-    }
-  }
-
-  private getAvailableOpenSearchClusters(): string[] {
-    try {
-      const fs = require('fs');
-      const yaml = require('js-yaml');
-      const path = require('path');
-
-      // Get config path from MCP server configuration
-      const opensearchConfig = this.mcpClients['opensearch-mcp-server']?.getConfig();
-      if (!opensearchConfig?.args) {
-        return [];
-      }
-
-      const configIndex = opensearchConfig.args.findIndex(arg => arg === '--config');
-      if (configIndex === -1 || configIndex + 1 >= opensearchConfig.args.length) {
-        return [];
-      }
-
-      const configPath = path.resolve(process.cwd(), opensearchConfig.args[configIndex + 1]);
-      if (!fs.existsSync(configPath)) {
-        return [];
-      }
-
-      const configContent = fs.readFileSync(configPath, 'utf8');
-      const config = yaml.load(configContent);
-
-      if (config?.clusters && typeof config.clusters === 'object') {
-        return Object.keys(config.clusters);
-      }
-
-      return [];
-    } catch (error) {
-      this.logger.debug('Error reading OpenSearch clusters', { error });
-      return [];
-    }
-  }
-
-  // Helper methods that reuse existing infrastructure
-  private prepareMessagesForBedrock(messages: any[]): any[] {
-    // Convert messages to Bedrock format
-    // Keep all messages with valid content
-    const prepared = messages
-      .filter(msg => {
-        // Keep all messages that have content (including empty arrays for assistant)
-        // Bedrock needs to see the full conversation flow including tool use/result pairs
-        if (msg.content === undefined || msg.content === null) {
-          return false;
-        }
-        // Keep messages with empty content arrays (assistant messages with only tool calls)
-        if (Array.isArray(msg.content) && msg.content.length === 0 && msg.role === 'assistant') {
-          return false; // Skip truly empty assistant messages
-        }
-        return true;
-      })
-      .map(msg => ({
-        role: msg.role || 'user',
-        // If content is already an array (proper format), use it directly
-        // This preserves toolUse and toolResult blocks
-        content: Array.isArray(msg.content) ? msg.content : [{ text: msg.content || '' }]
-      }));
-
-    // Debug logging to catch toolUse/toolResult mismatch
-    let toolUseCount = 0;
-    let toolResultCount = 0;
-
-    prepared.forEach((msg, index) => {
-      if (msg.role === 'assistant' && Array.isArray(msg.content)) {
-        const msgToolUses = msg.content.filter((c: any) => c.toolUse).length;
-        toolUseCount += msgToolUses;
-        if (msgToolUses > 0) {
-          this.logger.info(`Message ${index} (assistant): ${msgToolUses} toolUse blocks`);
-        }
-      }
-      if (msg.role === 'user' && Array.isArray(msg.content)) {
-        const msgToolResults = msg.content.filter((c: any) => c.toolResult).length;
-        toolResultCount += msgToolResults;
-        if (msgToolResults > 0) {
-          this.logger.info(`Message ${index} (user): ${msgToolResults} toolResult blocks`);
-        }
-      }
-    });
-
-    if (toolUseCount !== toolResultCount) {
-      this.logger.warn(`⚠️ Tool use/result mismatch detected!`, {
-        toolUseCount,
-        toolResultCount,
-        messageCount: prepared.length,
-        lastMessage: prepared[prepared.length - 1]
-      });
-    }
-
-    return prepared;
-  }
-
-  private prepareToolConfig(tools: any[]): any {
-    // Prepare tool configuration for Bedrock (same as Jarvis)
-    if (tools.length === 0) return undefined;
-
-    return {
-      tools: tools.map(tool => ({
-        toolSpec: tool.toolSpec
-      }))
-    };
-  }
-
-  private async processStreamingResponse(response: any, callbacks?: StreamingCallbacks): Promise<any> {
-    // Process streaming response from Bedrock
-    // We need to preserve the complete message structure including content blocks
-    const result = {
-      message: { 
-        role: 'assistant', 
-        content: [],  // This will hold all content blocks (text and toolUse)
-        textContent: '' // Keep text separately for convenience
-      },
-      toolCalls: []  // Keep this for backward compatibility
-    };
-
-    let currentTextBlock = '';
-    let currentToolUseBlock = null;
-    let hasAnyContent = false; // Track if we have any content at all
-
-    if (response.stream) {
-      for await (const chunk of response.stream) {
-        if (chunk.contentBlockStart) {
-          const start = chunk.contentBlockStart.start;
-          if (start?.text) {
-            // Start a new text block
-            currentTextBlock = start.text;
-            callbacks?.onTextStart?.(start.text);
-            result.message.textContent += start.text;
-            hasAnyContent = true;
-          } else if (start?.toolUse) {
-            // Start a new tool use block
-            currentToolUseBlock = {
-              toolUse: {
-                toolUseId: start.toolUse.toolUseId,
-                name: start.toolUse.name,
-                input: {}
-              },
-              inputBuffer: ''
-            };
-            
-            // Also track in toolCalls for backward compatibility
-            const toolCall = {
-              toolName: start.toolUse.name,
-              toolUseId: start.toolUse.toolUseId,
-              input: {}
-            };
-            result.toolCalls.push(toolCall);
-            hasAnyContent = true;
-          }
-        }
-
-        if (chunk.contentBlockDelta) {
-          const delta = chunk.contentBlockDelta.delta;
-          if (delta?.text) {
-            currentTextBlock += delta.text;
-            callbacks?.onTextDelta?.(delta.text);
-            result.message.textContent += delta.text;
-          } else if (delta?.toolUse && currentToolUseBlock && result.toolCalls.length > 0) {
-            const lastToolCall = result.toolCalls[result.toolCalls.length - 1];
-            try {
-              // Handle streaming JSON input - may be incomplete
-              if (delta.toolUse.input) {
-                // Accumulate input
-                currentToolUseBlock.inputBuffer += delta.toolUse.input;
-                
-                // Try to parse the accumulated input
-                try {
-                  const parsedInput = JSON.parse(currentToolUseBlock.inputBuffer);
-                  currentToolUseBlock.toolUse.input = parsedInput;
-                  lastToolCall.input = parsedInput;
-                } catch (parseError) {
-                  // JSON is incomplete, continue accumulating
-                }
-              }
-            } catch (error) {
-              this.logger.warn('Error processing tool use delta', { 
-                error: error.message,
-                input: delta.toolUse.input
-              });
-            }
-          }
-        }
-
-        if (chunk.contentBlockStop) {
-          // Finalize the current block and add it to content
-          if (currentTextBlock) {
-            result.message.content.push({ text: currentTextBlock });
-            currentTextBlock = '';
-          } else if (currentToolUseBlock) {
-            // Remove the inputBuffer before adding to content
-            const { inputBuffer, ...toolUseBlock } = currentToolUseBlock;
-            result.message.content.push(toolUseBlock);
-            currentToolUseBlock = null;
-          }
-        }
-      }
-    }
-    
-    // CRITICAL: If we have no content blocks at all (shouldn't happen but handle it),
-    // add an empty text block to ensure valid message format
-    if (result.message.content.length === 0 && !hasAnyContent) {
-      this.logger.warn('No content blocks received from Bedrock, adding empty text block');
-      result.message.content.push({ text: '' });
-    }
-
-    // Final cleanup - ensure all tool inputs are properly parsed
-    for (const toolCall of result.toolCalls) {
-      if (toolCall.inputBuffer && !toolCall.input) {
-        try {
-          toolCall.input = JSON.parse(toolCall.inputBuffer);
-        } catch (error) {
-          this.logger.error('Failed to parse final tool input', {
-            error: error.message,
-            buffer: toolCall.inputBuffer,
-            toolCall: toolCall.toolName
-          });
-          toolCall.input = {}; // Fallback to empty object
-        }
-      }
-      // Clean up the buffer
-      delete toolCall.inputBuffer;
-    }
-
-    return result;
-  }
-
-  private parseToolCallsFromXML(content: string): any[] {
-    const toolCalls: any[] = [];
-    
-    try {
-      // Extract the function_calls block
-      const functionCallsMatch = content.match(/<function_calls>([\s\S]*?)<\/function_calls>/);
-      if (!functionCallsMatch) return toolCalls;
-      
-      const functionCallsXML = functionCallsMatch[1];
-      
-      // Find all invoke blocks
-      const invokeMatches = functionCallsXML.matchAll(/<invoke name="([^"]+)">([\s\S]*?)<\/invoke>/g);
-      
-      for (const match of invokeMatches) {
-        const toolName = match[1];
-        const paramsXML = match[2];
-        
-        // Parse parameters
-        const params: Record<string, any> = {};
-        const paramMatches = paramsXML.matchAll(/<parameter name="([^"]+)">([^<]*)<\/parameter>/g);
-        
-        for (const paramMatch of paramMatches) {
-          const paramName = paramMatch[1];
-          const paramValue = paramMatch[2];
-          params[paramName] = paramValue;
-        }
-        
-        // Generate a unique tool use ID
-        const toolUseId = `tooluse_${Math.random().toString(36).substring(2, 15)}`;
-        
-        toolCalls.push({
-          toolName: toolName,
-          toolUseId: toolUseId,
-          input: params
-        });
-        
-        this.logger.info('Parsed tool call from XML', {
-          toolName,
-          toolUseId,
-          input: params
-        });
-      }
-    } catch (error) {
-      this.logger.error('Failed to parse tool calls from XML', {
-        error: error instanceof Error ? error.message : String(error),
-        content: content.substring(0, 500)
-      });
-    }
-    
-    return toolCalls;
-  }
-
-  private async executeToolCall(toolName: string, input: any): Promise<any> {
-    // Check if this is a client tool (should not reach here)
-    if (toolName.startsWith('ag_ui__')) {
-      this.logger.warn('Client tool reached server execution - this should not happen', { toolName });
-      return {
-        error: 'Client tools should be executed by the client, not the server',
-        toolName
-      };
-    }
-
-    // Execute MCP tool call
-    // Tool names come in format: serverName__toolName
-    const parts = toolName.split('__');
-    const serverName = parts[0];
-    const actualToolName = parts.slice(1).join('__');
-
-    const client = this.mcpClients[serverName];
-    if (!client) {
-      throw new Error(`MCP server ${serverName} not found for tool ${toolName}`);
-    }
-
-    const tools = client.getTools();
-    const tool = tools.find(t => t.name === actualToolName);
-    if (!tool) {
-      throw new Error(`Tool ${actualToolName} not found in server ${serverName}`);
-    }
-
-    return await client.executeTool(actualToolName, input);
-  }
 
   async processMessageWithCallbacks(
-    messages: any[],  // Full conversation history from UI
+    messages: any[], // Full conversation history from UI
     callbacks: StreamingCallbacks,
-    additionalInputs?: { state?: any; context?: any[]; tools?: any[]; threadId?: string; runId?: string; modelId?: string }
+    additionalInputs?: {
+      state?: any;
+      context?: any[];
+      tools?: any[];
+      threadId?: string;
+      runId?: string;
+      modelId?: string;
+    }
   ): Promise<void> {
     try {
       // Set logger context for correlation with AG UI audits
       if (additionalInputs?.threadId || additionalInputs?.runId) {
-        this.logger.setContext(additionalInputs.threadId, additionalInputs.runId);
+        this.logger.setContext(
+          additionalInputs.threadId,
+          additionalInputs.runId
+        );
       }
+
+      // Always initialize LLM logger for this run (even without IDs)
+      this.llmLogger.startRun(
+        additionalInputs?.runId || "unknown-run",
+        additionalInputs?.threadId || "unknown-thread"
+      );
 
       // Create initial state with the full conversation history
       const initialState: ReactAgentState = {
-        messages: messages,  // Use the messages directly from UI
+        messages: messages, // Use the messages directly from UI
         currentStep: "processInput",
         toolCalls: [],
         toolResults: {},
@@ -1342,20 +193,24 @@ Example: If user says "search the osd-ops cluster", use opensearch_cluster_name:
         clientTools: additionalInputs?.tools,
         threadId: additionalInputs?.threadId,
         runId: additionalInputs?.runId,
-        modelId: additionalInputs?.modelId
+        modelId: additionalInputs?.modelId,
       };
 
       // Run the graph - unique config per request for stateless operation
       const config = {
         configurable: {
-          thread_id: `${additionalInputs?.threadId || 'session'}_${additionalInputs?.runId || Date.now()}`
-        }
+          thread_id: `${additionalInputs?.threadId || "session"}_${
+            additionalInputs?.runId || Date.now()
+          }`,
+        },
       };
       await this.compiledGraph.invoke(initialState, config);
-
     } catch (error) {
-      const errorMessage = error instanceof Error ? error.message : String(error);
-      this.logger.error('Error processing message with callbacks', { error: errorMessage });
+      const errorMessage =
+        error instanceof Error ? error.message : String(error);
+      this.logger.error("Error processing message with callbacks", {
+        error: errorMessage,
+      });
       callbacks.onError?.(errorMessage);
     }
   }
@@ -1363,9 +218,7 @@ Example: If user says "search the osd-ops cluster", use opensearch_cluster_name:
   async sendMessage(message: string): Promise<void> {
     // For CLI mode - create a simple message array with just the user message
     // In CLI mode, we don't maintain conversation history (stateless)
-    const messages = [
-      { role: 'user', content: [{ text: message }] }
-    ];
+    const messages = [{ role: "user", content: [{ text: message }] }];
 
     const callbacks: StreamingCallbacks = {
       onTextStart: (text: string) => {
@@ -1375,88 +228,55 @@ Example: If user says "search the osd-ops cluster", use opensearch_cluster_name:
         process.stdout.write(delta);
       },
       onToolUseStart: (toolName: string, _toolUseId: string, input: any) => {
-        console.log(`\n🔧 Using tool: ${toolName.split('__').pop() || toolName}`);
+        console.log(
+          `\n🔧 Using tool: ${toolName.split("__").pop() || toolName}`
+        );
         console.log(`   Input: ${JSON.stringify(input, null, 2)}`);
       },
       onToolResult: (toolName: string, _toolUseId: string, result: any) => {
-        console.log(`✅ Tool result:`, JSON.stringify(result, null, 2).substring(0, 500));
+        console.log(
+          `✅ Tool result:`,
+          JSON.stringify(result, null, 2).substring(0, 500)
+        );
       },
       onToolError: (toolName: string, _toolUseId: string, error: string) => {
         console.log(`❌ Tool error:`, error);
       },
       onTurnComplete: () => {
-        console.log('\n');
+        console.log("\n");
       },
       onError: (error: string) => {
-        console.error('Error:', error);
-      }
+        console.error("Error:", error);
+      },
     };
 
     await this.processMessageWithCallbacks(messages, callbacks);
   }
 
   getAllTools(includeClientTools: boolean = false, clientTools?: any[]): any[] {
-    // Get all tools from all MCP clients and format for Bedrock
-    const allTools: any[] = [];
-
-    // Add MCP server tools
-    for (const [serverName, client] of Object.entries(this.mcpClients)) {
-      const serverTools = client.getTools();
-
-      for (const tool of serverTools) {
-        // Format tool for Bedrock API (matching Jarvis format)
-        allTools.push({
-          toolSpec: {
-            name: `${serverName}__${tool.name}`,
-            description: tool.description || `Tool: ${tool.name}`,
-            inputSchema: {
-              json: tool.inputSchema
-            }
-          },
-          isClientTool: false  // Mark as MCP tool
-        });
-      }
-    }
-
-    // Add client tools if requested (for dual tool system)
-    if (includeClientTools && clientTools) {
-      for (const tool of clientTools) {
-        allTools.push({
-          toolSpec: {
-            name: `ag_ui__${tool.name}`,  // Prefix with ag_ui to distinguish
-            description: tool.description || `Client tool: ${tool.name}`,
-            inputSchema: {
-              json: tool.parameters || {}
-            }
-          },
-          isClientTool: true  // Mark as client tool
-        });
-      }
-    }
-
-    return allTools;
+    return this.toolExecutor.getAllTools(includeClientTools, clientTools);
   }
 
   async startInteractiveMode(): Promise<void> {
-    console.log('🤖 ReAct Agent Ready!');
-    console.log('📊 Using ReAct pattern (Reasoning + Acting) with MCP tools');
+    console.log("🤖 ReAct Agent Ready!");
+    console.log("📊 Using ReAct pattern (Reasoning + Acting) with MCP tools");
     console.log('💡 Type your message or "exit" to quit\n');
 
     this.rl = readline.createInterface({
       input: process.stdin,
       output: process.stdout,
-      prompt: '> '
+      prompt: "> ",
     });
 
     // Return a Promise that resolves only when user quits
     return new Promise<void>((resolve) => {
       this.rl!.prompt();
 
-      this.rl!.on('line', async (line) => {
+      this.rl!.on("line", async (line) => {
         const input = line.trim();
-        
-        if (input.toLowerCase() === 'exit' || input.toLowerCase() === 'quit') {
-          console.log('👋 Goodbye!');
+
+        if (input.toLowerCase() === "exit" || input.toLowerCase() === "quit") {
+          console.log("👋 Goodbye!");
           this.cleanup();
           resolve(); // Resolve the Promise instead of calling process.exit(0)
           return;
@@ -1469,24 +289,28 @@ Example: If user says "search the osd-ops cluster", use opensearch_cluster_name:
         this.rl!.prompt();
       });
 
-      this.rl!.on('close', () => {
-        console.log('\n👋 Goodbye!');
+      this.rl!.on("close", () => {
+        console.log("\n👋 Goodbye!");
         this.cleanup();
         resolve(); // Resolve the Promise instead of calling process.exit(0)
       });
     });
   }
 
+  get systemPrompt(): string {
+    return this.promptManager.getBaseSystemPrompt();
+  }
+
   cleanup(): void {
     if (this.rl) {
       this.rl.close();
     }
-    
+
     // Disconnect all MCP clients
     for (const client of Object.values(this.mcpClients)) {
       client.disconnect();
     }
-    
-    this.logger.info('ReAct Agent cleanup completed');
+
+    this.logger.info("ReAct Agent cleanup completed");
   }
 }
