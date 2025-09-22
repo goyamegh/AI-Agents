@@ -197,6 +197,89 @@ source=ai-agent-logs-*
 | where count > 100
 ```
 
+**Advanced PPL Query Patterns:**
+
+**Top N Analysis with Filtering:**
+```ppl
+source=ai-agent-logs-*
+| where timestamp >= now() - 1h
+| top 20 message by level
+| where level in ["ERROR", "WARN"]
+```
+
+**Deduplication and Unique Values:**
+```ppl
+source=ai-agent-audit-logs-*
+| dedup thread_id
+| fields thread_id, run_id, timestamp
+| sort - timestamp
+```
+
+**Fillnull for Missing Data Handling:**
+```ppl
+source=ai-agent-metrics-*
+| fillnull with 0 in cpu_usage, memory_usage
+| stats avg(cpu_usage) as avg_cpu, avg(memory_usage) as avg_mem by host
+```
+
+**Rare Events Detection:**
+```ppl
+source=ai-agent-logs-*
+| rare 10 error_code
+| where count < 5
+```
+
+**Field Extraction with Grok:**
+```ppl
+source=ai-agent-logs-*
+| grok message '%{TIMESTAMP_ISO8601:timestamp} %{LOGLEVEL:level} %{GREEDYDATA:msg}'
+| stats count() by level
+```
+
+**Time Span Aggregations:**
+```ppl
+source=ai-agent-metrics-*
+| stats count() by span(timestamp, 5m) as time_bucket, status
+| where status != 200
+```
+
+**Eval with Conditional Logic:**
+```ppl
+source=ai-agent-logs-*
+| eval severity = case(
+    level = "ERROR", 1,
+    level = "WARN", 2,
+    level = "INFO", 3,
+    else = 4
+  )
+| stats count() by severity
+```
+
+**Join Operations (with Calcite enabled):**
+```ppl
+source=ai-agent-logs-*
+| join left=l right=r on l.thread_id = r.thread_id
+  [ source=ai-agent-audit-logs-* ]
+| fields l.timestamp, l.message, r.tool_name
+```
+
+**Subquery for Complex Filtering:**
+```ppl
+source=ai-agent-logs-*
+| where thread_id in [
+    source=ai-agent-audit-logs-*
+    | where tool_name = "opensearch__search"
+    | fields thread_id
+  ]
+```
+
+**Trendline for Moving Averages:**
+```ppl
+source=ai-agent-metrics-*
+| trendline SMA(5, cpu_usage) as cpu_trend
+| fields timestamp, cpu_usage, cpu_trend
+```
+
 ### PPL Best Practices
 
 1. **Index Patterns**: Use wildcards for daily indices: `source=ai-agent-logs-*`
