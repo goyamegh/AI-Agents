@@ -239,6 +239,18 @@ export class BaseAGUIAdapter {
         input.runId,
         input  // Pass the full input
       );
+      
+      // Emit text message end FIRST to close the message stream
+      this.emitAndAuditEvent(
+        {
+          type: EventType.TEXT_MESSAGE_END,
+          messageId,
+          timestamp: Date.now(),
+        } as TextMessageEndEvent,
+        observer,
+        input.threadId,
+        input.runId
+      );
 
       // Emit run finished event
       this.emitAndAuditEvent(
