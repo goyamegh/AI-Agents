@@ -240,36 +240,6 @@ export class BaseAGUIAdapter {
         input  // Pass the full input
       );
 
-      // Emit thinking end after agent reasoning
-      // observer.next({
-      //   type: EventType.THINKING_TEXT_MESSAGE_END,
-      //   timestamp: Date.now()
-      // });
-
-      // observer.next({
-      //   type: EventType.THINKING_END,
-      //   timestamp: Date.now()
-      // } as ThinkingEndEvent);
-
-      // Don't emit STEP_FINISHED for agent_processing - we removed the corresponding STEP_STARTED
-      // this.emitAndAuditEvent({
-      //   type: EventType.STEP_FINISHED,
-      //   stepName: `${agentType}_agent_processing`,
-      //   timestamp: Date.now()
-      // } as StepFinishedEvent, observer, input.threadId, input.runId);
-
-      // Emit text message end FIRST to close the message stream
-      this.emitAndAuditEvent(
-        {
-          type: EventType.TEXT_MESSAGE_END,
-          messageId,
-          timestamp: Date.now(),
-        } as TextMessageEndEvent,
-        observer,
-        input.threadId,
-        input.runId
-      );
-
       // Emit run finished event
       this.emitAndAuditEvent(
         {
@@ -508,13 +478,18 @@ export class BaseAGUIAdapter {
             runId
           );
 
-          // Also add a text message for visibility in the chat
-          // this.emitAndAuditEvent({
-          //   type: EventType.TEXT_MESSAGE_CONTENT,
-          //   messageId,
-          //   delta: `\n\n🔧 Using tool: ${actualToolName}`,
-          //   timestamp: Date.now()
-          // } as TextMessageContentEvent, observer, threadId, runId);
+          // Emit TOOL_CALL_END event FIRST
+          this.emitAndAuditEvent(
+            {
+              type: EventType.TOOL_CALL_END,
+              toolCallId: toolUseId,
+              timestamp: Date.now(),
+            } as ToolCallEndEvent,
+            observer,
+            threadId,
+            runId
+          );
+
         },
         onToolResult: (toolName: string, toolUseId: string, result: any) => {
           const actualToolName = toolName.split("__")[1] || toolName;
