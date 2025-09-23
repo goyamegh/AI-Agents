@@ -125,7 +125,7 @@ class OpenSearchIngestor {
               properties: {
                 timestamp: {
                   type: 'date',
-                  format: 'strict_date_optional_time||epoch_millis||yyyy-MM-dd HH:mm:ss||MMM dd, yyyy, HH:mm:ss z'
+                  format: 'strict_date_optional_time||epoch_millis'
                 },
                 level: { type: 'keyword' },
                 message: { type: 'text' },
@@ -177,10 +177,43 @@ class OpenSearchIngestor {
         const level = readableTimestampMatch[3];
         const message = readableTimestampMatch[4];
 
-        // Keep the original timestamp string - OpenSearch will parse it
-        // The format "Sep 16, 2025, 15:38:44 PDT" should work with our mapping
+        // Convert human-readable timestamp to ISO format
+        let parsedTimestamp: string;
+        try {
+          // Parse the format "Sep 21, 2025, 23:40:48 PDT"
+          const dateFormats = [
+            'MMM dd, yyyy, HH:mm:ss zzz',
+            'MMM dd, yyyy, HH:mm:ss',
+            'yyyy-MM-dd HH:mm:ss',
+            'MM/dd/yyyy HH:mm:ss'
+          ];
+          
+          let parsedDate: Date | null = null;
+          for (const formatStr of dateFormats) {
+            try {
+              parsedDate = parse(dateStr, formatStr, new Date());
+              if (isValid(parsedDate)) {
+                break;
+              }
+            } catch (e) {
+              // Try next format
+            }
+          }
+          
+          if (parsedDate && isValid(parsedDate)) {
+            parsedTimestamp = parsedDate.toISOString();
+          } else {
+            // Fallback: use current time if parsing fails
+            console.warn(`Could not parse timestamp: ${dateStr}, using current time`);
+            parsedTimestamp = new Date().toISOString();
+          }
+        } catch (error) {
+          console.warn(`Error parsing timestamp: ${dateStr}, using current time`, error);
+          parsedTimestamp = new Date().toISOString();
+        }
+
         entry = {
-          timestamp: dateStr,
+          timestamp: parsedTimestamp,
           level,
           message,
           source: filename.includes('audit') ? 'audit-logs' : 'logs',
