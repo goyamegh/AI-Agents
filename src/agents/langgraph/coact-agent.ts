@@ -143,8 +143,8 @@ export class CoActAgent implements BaseAgent {
     if (customSystemPrompt) {
       this.systemPrompt = customSystemPrompt;
     } else {
-      const promptPath = join(__dirname, '../../prompts/claudecode.md');
-      
+      const promptPath = join(__dirname, '../../prompts/observability-prompt.md');
+
       try {
         if (existsSync(promptPath)) {
           this.systemPrompt = readFileSync(promptPath, 'utf-8');
