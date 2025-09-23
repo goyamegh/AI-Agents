@@ -96,7 +96,7 @@ export class ReactGraphNodes {
     const bedrockMessages = this.prepareMessagesForBedrock(messages);
 
     // Get available tools - but don't provide tools if we're at max iterations (to force a final response)
-    const tools = this.toolExecutor.getAllTools();
+    const tools = this.toolExecutor.getAllTools(true, clientTools);
 
     // Check if there are tool results in the message history (properly formatted)
     const hasToolResultsInHistory = messages.some(
