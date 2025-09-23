@@ -63,6 +63,9 @@ export class LangGraphAGUIAdapter extends BaseAGUIAdapter {
   async runAgent(input: RunAgentInput): Promise<Observable<BaseEvent>> {
     const baseObservable = await super.runAgent(input);
 
+    // Capture threadId and runId for audit logging
+    const { threadId, runId } = input;
+
     // Return a new observable that enhances base events with LangGraph specifics
     return new Observable<BaseEvent>((observer) => {
       // Initialize LangGraph state tracking
@@ -96,7 +99,7 @@ export class LangGraphAGUIAdapter extends BaseAGUIAdapter {
             this.textMessageActive = false;
 
             // Forward the TEXT_MESSAGE_END event FIRST
-            observer.next(event);
+            this.emitAndAuditEvent(event, observer, threadId, runId);
 
             // Then emit any pending NON-TOOL step events AFTER TEXT_MESSAGE_END
             // Tool events should flow through in real-time after text ends
@@ -108,7 +111,7 @@ export class LangGraphAGUIAdapter extends BaseAGUIAdapter {
             );
 
             for (const pendingEvent of nonToolEvents) {
-              observer.next(pendingEvent);
+              this.emitAndAuditEvent(pendingEvent, observer, threadId, runId);
             }
 
             // Clear only the non-tool events - tool events should have flowed through already
@@ -126,10 +129,10 @@ export class LangGraphAGUIAdapter extends BaseAGUIAdapter {
             runStartedEmitted = true;
             
             // Forward RUN_STARTED first
-            observer.next(event);
+            this.emitAndAuditEvent(event, observer, threadId, runId);
             
             // Then emit LangGraph initial state
-            observer.next({
+            this.emitAndAuditEvent({
               type: EventType.STATE_SNAPSHOT,
               snapshot: {
                 ...this.graphState,
@@ -147,7 +150,7 @@ export class LangGraphAGUIAdapter extends BaseAGUIAdapter {
                 }
               },
               timestamp: Date.now()
-            } as StateSnapshotEvent);
+            } as StateSnapshotEvent, observer, threadId, runId);
             
             return; // Don't forward the RUN_STARTED again
           }
@@ -155,20 +158,15 @@ export class LangGraphAGUIAdapter extends BaseAGUIAdapter {
           if (event.type === EventType.STEP_STARTED) {
             const stepEvent = event as StepStartedEvent;
 
-            // Track graph node transitions
-            // Don't emit node transitions during text message - causes event ordering issues
-            // if (stepEvent.stepName?.includes('_agent_processing')) {
-            //   this.emitNodeTransition(observer, 'processInput');
-            // }
           } else if (event.type === EventType.TOOL_CALL_START) {
             // Handle the first tool call during active text message
             if (this.textMessageActive && !this.hasToolCallsOccurred) {
               // This is the first tool call - emit TEXT_MESSAGE_END for current message
-              observer.next({
+              this.emitAndAuditEvent({
                 type: EventType.TEXT_MESSAGE_END,
                 messageId: this.currentMessageId,
                 timestamp: Date.now()
-              } as TextMessageEndEvent);
+              } as TextMessageEndEvent, observer, threadId, runId);
 
               this.textMessageActive = false;
               this.hasToolCallsOccurred = true;
@@ -176,8 +174,9 @@ export class LangGraphAGUIAdapter extends BaseAGUIAdapter {
 
             // Track tool execution in graph state
             this.graphState.toolCallsPending = (this.graphState.toolCallsPending || 0) + 1;
-            // Don't emit node transitions for tool events - they're handled during deferred processing
-            // this.emitNodeTransition(observer, 'executeTools');
+
+            this.emitAndAuditEvent(event, observer, threadId, runId);
+            return; // Don't forward again at the end
           } else if (event.type === EventType.TOOL_CALL_END) {
             // Update tool completion tracking
             this.graphState.toolCallsCompleted = (this.graphState.toolCallsCompleted || 0) + 1;
@@ -199,12 +198,12 @@ export class LangGraphAGUIAdapter extends BaseAGUIAdapter {
             if (this.hasToolCallsOccurred && !this.isSecondTextMessage && !this.textMessageActive) {
               // Start second text message for continuation
               const newMessageId = uuidv4();
-              observer.next({
+              this.emitAndAuditEvent({
                 type: EventType.TEXT_MESSAGE_START,
                 messageId: newMessageId,
                 role: 'assistant',
                 timestamp: Date.now()
-              } as TextMessageStartEvent);
+              } as TextMessageStartEvent, observer, threadId, runId);
 
               this.currentMessageId = newMessageId;
               this.textMessageActive = true;
@@ -218,7 +217,7 @@ export class LangGraphAGUIAdapter extends BaseAGUIAdapter {
                 ...event,
                 messageId: this.currentMessageId
               };
-              observer.next(updatedEvent);
+              this.emitAndAuditEvent(updatedEvent, observer, threadId, runId);
               return; // Don't forward the original event
             }
           } else if (event.type === EventType.RUN_FINISHED) {
@@ -228,27 +227,27 @@ export class LangGraphAGUIAdapter extends BaseAGUIAdapter {
             if (this.graphState.currentNode && this.graphState.currentNode !== 'END') {
               const finalStepName = `graph_node_${this.graphState.currentNode}`;
               if (this.activeSteps.has(finalStepName)) {
-                observer.next({
+                this.emitAndAuditEvent({
                   type: EventType.STEP_FINISHED,
                   stepName: finalStepName,
                   timestamp: Date.now()
-                } as StepFinishedEvent);
+                } as StepFinishedEvent, observer, threadId, runId);
                 this.activeSteps.delete(finalStepName);
               }
             }
             
             // Finish all remaining active steps
             for (const activeStepName of this.activeSteps) {
-              observer.next({
+              this.emitAndAuditEvent({
                 type: EventType.STEP_FINISHED,
                 stepName: activeStepName,
                 timestamp: Date.now()
-              } as StepFinishedEvent);
+              } as StepFinishedEvent, observer, threadId, runId);
             }
             this.activeSteps.clear();
             
             // Emit final graph traversal summary
-            observer.next({
+            this.emitAndAuditEvent({
               type: EventType.STATE_SNAPSHOT,
               snapshot: {
                 ...this.graphState,
@@ -259,7 +258,7 @@ export class LangGraphAGUIAdapter extends BaseAGUIAdapter {
                 totalToolCalls: this.graphState.toolCallsCompleted
               },
               timestamp: Date.now()
-            } as StateSnapshotEvent);
+            } as StateSnapshotEvent, observer, threadId, runId);
           }
           
           // Filter events based on text message state - only defer state/step events
@@ -274,7 +273,7 @@ export class LangGraphAGUIAdapter extends BaseAGUIAdapter {
           }
           
           // Forward all other events
-          observer.next(event);
+          this.emitAndAuditEvent(event, observer, threadId, runId);
         },
         error: (err) => observer.error(err),
         complete: () => {
@@ -291,14 +290,14 @@ export class LangGraphAGUIAdapter extends BaseAGUIAdapter {
   /**
    * Emit node transition events for graph visualization
    */
-  private emitNodeTransition(observer: any, nodeName: string): void {
+  private emitNodeTransition(observer: any, nodeName: string, threadId: string, runId: string): void {
     // If text message is active, defer the step events
     if (this.textMessageActive) {
       this.deferStepEventsForNode(nodeName);
       return;
     }
     
-    this.emitStepEventsForNode(observer, nodeName);
+    this.emitStepEventsForNode(observer, nodeName, threadId, runId);
   }
   
   /**
@@ -366,7 +365,7 @@ export class LangGraphAGUIAdapter extends BaseAGUIAdapter {
   /**
    * Emit step events immediately
    */
-  private emitStepEventsForNode(observer: any, nodeName: string): void {
+  private emitStepEventsForNode(observer: any, nodeName: string, threadId: string, runId: string): void {
     // This is the original implementation moved here
     // Update graph state
     const previousNode = this.graphState.currentNode;
@@ -383,7 +382,7 @@ export class LangGraphAGUIAdapter extends BaseAGUIAdapter {
     const stepName = `graph_node_${nodeName}`;
     this.activeSteps.add(stepName);
     
-    observer.next({
+    this.emitAndAuditEvent({
       type: EventType.STEP_STARTED,
       stepName,
       metadata: {
@@ -393,10 +392,10 @@ export class LangGraphAGUIAdapter extends BaseAGUIAdapter {
         executionCount: this.graphState.nodeExecutions[nodeName]
       },
       timestamp: Date.now()
-    } as StepStartedEvent);
+    } as StepStartedEvent, observer, threadId, runId);
 
     // Emit updated state snapshot with LangGraph-specific data
-    observer.next({
+    this.emitAndAuditEvent({
       type: EventType.STATE_SNAPSHOT,
       snapshot: {
         graphType: 'LangGraph',
@@ -410,18 +409,18 @@ export class LangGraphAGUIAdapter extends BaseAGUIAdapter {
         nodes: ['processInput', 'callModel', 'executeTools', 'generateResponse']
       },
       timestamp: Date.now()
-    } as StateSnapshotEvent);
+    } as StateSnapshotEvent, observer, threadId, runId);
 
     // Emit step finished for previous node
     if (previousNode && previousNode !== 'START') {
       const previousStepName = `graph_node_${previousNode}`;
       this.activeSteps.delete(previousStepName);
       
-      observer.next({
+      this.emitAndAuditEvent({
         type: EventType.STEP_FINISHED,
         stepName: previousStepName,
         timestamp: Date.now()
-      } as StepFinishedEvent);
+      } as StepFinishedEvent, observer, threadId, runId);
     }
   }
 
