@@ -185,8 +185,7 @@ export class HTTPServer {
           return;
         }
 
-        // Set logger context for correlation
-        this.logger.setContext(input.threadId, input.runId);
+        // Logger context will be set by base-ag-ui-adapter with request ID
 
         this.logger.info('Running agent via SSE streaming', {
           threadId: input.threadId,

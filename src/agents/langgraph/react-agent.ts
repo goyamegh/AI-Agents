@@ -159,15 +159,17 @@ export class ReactAgent implements BaseAgent {
       tools?: any[];
       threadId?: string;
       runId?: string;
+      requestId?: string;
       modelId?: string;
     }
   ): Promise<void> {
     try {
       // Set logger context for correlation with AG UI audits
-      if (additionalInputs?.threadId || additionalInputs?.runId) {
+      if (additionalInputs?.threadId || additionalInputs?.runId || additionalInputs?.requestId) {
         this.logger.setContext(
           additionalInputs.threadId,
-          additionalInputs.runId
+          additionalInputs.runId,
+          additionalInputs.requestId
         );
       }
 

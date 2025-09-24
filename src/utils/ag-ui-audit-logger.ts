@@ -9,6 +9,7 @@ export class AGUIAuditLogger extends BaseLogger {
   private activeRequests = new Map<string, {
     threadId: string;
     runId: string;
+    requestId?: string;
     logFile: string;
     startTime: number;
   }>();
@@ -21,7 +22,7 @@ export class AGUIAuditLogger extends BaseLogger {
   /**
    * Start audit logging for a request
    */
-  startRequest(threadId: string, runId: string): void {
+  startRequest(threadId: string, runId: string, requestId?: string): void {
     const timestamp = this.getTimestamp();
     const dateStr = this.getDateString(timestamp.unix);
     const requestKey = `${threadId}_${runId}`;
@@ -30,6 +31,7 @@ export class AGUIAuditLogger extends BaseLogger {
     this.activeRequests.set(requestKey, {
       threadId,
       runId,
+      requestId,
       logFile,
       startTime: timestamp.unix
     });
@@ -40,7 +42,8 @@ export class AGUIAuditLogger extends BaseLogger {
       human_timestamp: this.toHumanTimestamp(timestamp.unix),
       event_type: 'REQUEST_START',
       thread_id: threadId,
-      run_id: runId
+      run_id: runId,
+      request_id: requestId
     };
 
     this.writeToFile(logFile, JSON.stringify(entry) + '\n');
@@ -66,6 +69,7 @@ export class AGUIAuditLogger extends BaseLogger {
       event_type: 'AG_UI_EVENT',
       thread_id: threadId,
       run_id: runId,
+      request_id: request.requestId,
       ag_ui_event: {
         type: event.type,
         timestamp: event.timestamp,
@@ -97,6 +101,7 @@ export class AGUIAuditLogger extends BaseLogger {
       event_type: 'HTTP_REQUEST',
       thread_id: threadId,
       run_id: runId,
+      request_id: request.requestId,
       http_request: requestData
     };
 
@@ -148,6 +153,7 @@ export class AGUIAuditLogger extends BaseLogger {
       event_type: 'REQUEST_END',
       thread_id: threadId,
       run_id: runId,
+      request_id: request.requestId,
       outcome,
       duration_ms: duration,
       error_message: errorMessage || null

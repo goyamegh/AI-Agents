@@ -72,7 +72,7 @@ export class BaseAGUIAdapter {
     mcpConfigs: Record<string, MCPServerConfig> = {}
   ): Promise<void> {
     const agentType = this.agent.getAgentType();
-    this.logger.info(`Initializing ${agentType} AG UI Adapter`);
+    this.logger.debug(`Initializing ${agentType} AG UI Adapter`);
 
     // Check for custom system prompt file path from environment variable
     let customSystemPrompt: string | undefined = undefined;
@@ -106,7 +106,7 @@ export class BaseAGUIAdapter {
     // Initialize agent with MCP configs and custom system prompt
     await this.agent.initialize(mcpConfigs, customSystemPrompt);
 
-    this.logger.info(`${agentType} AG UI Adapter initialized`);
+    this.logger.debug(`${agentType} AG UI Adapter initialized`);
   }
 
   /**
@@ -115,21 +115,25 @@ export class BaseAGUIAdapter {
   async runAgent(input: RunAgentInput): Promise<Observable<BaseEvent>> {
     const agentType = this.agent.getAgentType();
 
-    // Set logger context for correlation
-    this.logger.setContext(input.threadId, input.runId);
+    // Generate unique request ID for this specific request
+    const requestId = `req-${uuidv4().slice(0, 8)}`;
 
-    this.logger.info(`Running ${agentType} agent with AG UI input`, {
+    // Set logger context for correlation
+    this.logger.setContext(input.threadId, input.runId, requestId);
+
+    this.logger.debug(`Running ${agentType} agent with AG UI input`, {
       threadId: input.threadId,
       runId: input.runId,
+      requestId: requestId,
       messageCount: input.messages.length,
       toolCount: input.tools?.length || 0,
     });
 
     return new Observable<BaseEvent>((observer) => {
       // Start audit logging for this request
-      this.auditLogger?.startRequest(input.threadId, input.runId);
+      this.auditLogger?.startRequest(input.threadId, input.runId, requestId);
 
-      this.processAgentRequestWithEvents(input, observer).catch((error) => {
+      this.processAgentRequestWithEvents(input, observer, requestId).catch((error) => {
         const errorMessage =
           error instanceof Error ? error.message : String(error);
         this.logger.error("Error in processAgentRequestWithEvents", {
@@ -185,7 +189,8 @@ export class BaseAGUIAdapter {
    */
   private async processAgentRequestWithEvents(
     input: RunAgentInput,
-    observer: any
+    observer: any,
+    requestId: string
   ): Promise<void> {
     const agentType = this.agent.getAgentType();
 
@@ -243,6 +248,7 @@ export class BaseAGUIAdapter {
         observer,
         input.threadId,
         input.runId,
+        requestId,  // Pass request ID
         input  // Pass the full input
       );
 
@@ -325,7 +331,7 @@ export class BaseAGUIAdapter {
         const jsonStr = stateDeltaMatch[0];
         const parsed = JSON.parse(jsonStr);
         if (parsed.delta?.ppl_query) {
-          this.logger.info('PPL query detected in STATE_DELTA format', {
+          this.logger.debug('PPL query detected in STATE_DELTA format', {
             query: parsed.delta.ppl_query.query,
             dataset: parsed.delta.ppl_query.dataset
           });
@@ -338,7 +344,7 @@ export class BaseAGUIAdapter {
       if (pplBlockMatch) {
         const query = pplBlockMatch[1].trim();
         if (query) {
-          this.logger.info('PPL query detected in code block', { query });
+          this.logger.debug('PPL query detected in code block', { query });
           // Try to extract dataset from query (source=dataset pattern)
           const datasetMatch = query.match(/source\s*=\s*([^\s|]+)/);
           const dataset = datasetMatch ? datasetMatch[1] : 'unknown';
@@ -365,7 +371,7 @@ export class BaseAGUIAdapter {
           const datasetMatch = query.match(/source\s*=\s*([^\s|]+)/);
           const dataset = datasetMatch ? datasetMatch[1] : 'unknown';
 
-          this.logger.info('Inline PPL query detected', { query, dataset });
+          this.logger.debug('Inline PPL query detected', { query, dataset });
           return {
             query: query,
             description: 'Inline PPL query',
@@ -390,6 +396,7 @@ export class BaseAGUIAdapter {
     observer: any,
     threadId: string,
     runId: string,
+    requestId: string,  // Add request ID parameter
     fullInput?: RunAgentInput  // Add parameter for full input
   ): Promise<void> {
     const agentType = this.agent.getAgentType();
@@ -429,7 +436,7 @@ export class BaseAGUIAdapter {
               this.pendingStateDeltas.push({
                 ppl_query: pplQuery
               });
-              this.logger.info('PPL query added to pending state deltas', {
+              this.logger.debug('PPL query added to pending state deltas', {
                 query: pplQuery.query,
                 pendingCount: this.pendingStateDeltas.length
               });
@@ -452,25 +459,7 @@ export class BaseAGUIAdapter {
           // Emit proper TOOL_CALL_START event
           const actualToolName = toolName.split("__")[1] || toolName;
 
-          // Don't emit STEP_STARTED during TEXT_MESSAGE - it causes event ordering issues
-          // this.emitAndAuditEvent({
-          //   type: EventType.STEP_STARTED,
-          //   stepName: `tool_execution_${actualToolName}`,
-          //   timestamp: Date.now()
-          // } as StepStartedEvent, observer, threadId, runId);
-
-          // Emit thinking start for tool decision
-          // this.emitAndAuditEvent({
-          //   type: EventType.THINKING_START,
-          //   timestamp: Date.now()
-          // } as ThinkingStartEvent, observer, threadId, runId);
-
-          // this.emitAndAuditEvent({
-          //   type: EventType.THINKING_TEXT_MESSAGE_START,
-          //   title: `Executing ${actualToolName}`,
-          //   timestamp: Date.now()
-          // }, observer, threadId, runId);
-
+        
           this.emitAndAuditEvent(
             {
               type: EventType.TOOL_CALL_START,
@@ -572,7 +561,7 @@ export class BaseAGUIAdapter {
         onTurnComplete: () => {
           // Turn completed - emit any pending state deltas before message ends
           if (this.pendingStateDeltas.length > 0) {
-            this.logger.info('Emitting pending STATE_DELTA events', {
+            this.logger.debug('Emitting pending STATE_DELTA events', {
               count: this.pendingStateDeltas.length
             });
 
@@ -625,6 +614,7 @@ export class BaseAGUIAdapter {
           tools: fullInput?.tools,  // Pass client tools from AG UI
           threadId: fullInput?.threadId,
           runId: fullInput?.runId,
+          requestId: requestId,  // Pass request ID for logging correlation
           modelId: fullInput?.forwardedProps?.modelId  // Extract modelId from forwardedProps
         });
       } else {

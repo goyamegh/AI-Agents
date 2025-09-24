@@ -98,7 +98,7 @@ export class CoActAgent implements BaseAgent {
       region: region
     });
     
-    this.logger.info('CoAct Agent initialized', {
+    this.logger.debug('CoAct Agent initialized', {
       region: region,
       hasAwsAccessKey: !!process.env.AWS_ACCESS_KEY_ID,
       hasAwsSecretKey: !!process.env.AWS_SECRET_ACCESS_KEY,
@@ -115,14 +115,14 @@ export class CoActAgent implements BaseAgent {
     configs: Record<string, MCPServerConfig>, 
     customSystemPrompt?: string
   ): Promise<void> {
-    this.logger.info('Initializing CoAct Agent', {
+    this.logger.debug('Initializing CoAct Agent', {
       serverCount: Object.keys(configs).length,
       servers: Object.keys(configs)
     });
 
     // Connect to all MCP servers (reuse existing infrastructure)
     for (const [name, config] of Object.entries(configs)) {
-      this.logger.info(`Connecting to MCP server: ${name}`);
+      this.logger.debug(`Connecting to MCP server: ${name}`);
       
       // Create appropriate client based on config type
       let client: BaseMCPClient;
@@ -136,7 +136,7 @@ export class CoActAgent implements BaseAgent {
       this.mcpClients[name] = client;
       
       const tools = client.getTools();
-      this.logger.info(`Connected to ${name}, available tools: ${tools.length}`);
+      this.logger.debug(`Connected to ${name}, available tools: ${tools.length}`);
     }
 
     // Load system prompt (use the same prompt as other agents)
@@ -455,7 +455,7 @@ Remember: Output ONLY the JSON object, no additional text.`;
     const { messages, streamingCallbacks, iterations, toolResults, clientState, clientContext, threadId, runId, modelId } = state;
 
     // Log full state including client inputs
-    this.logger.info('CoAct agent full state', {
+    this.logger.debug('CoAct agent full state', {
       clientState,
       clientContext,
       threadId,
@@ -466,7 +466,7 @@ Remember: Output ONLY the JSON object, no additional text.`;
       hasToolResults: Object.keys(toolResults).length > 0
     });
 
-    this.logger.info('📥 callModelNode: Starting', {
+    this.logger.debug('📥 callModelNode: Starting', {
       iterations,
       maxIterations: state.maxIterations,
       messageCount: messages.length,
@@ -492,7 +492,7 @@ Remember: Output ONLY the JSON object, no additional text.`;
     const atMaxIterations = iterations >= state.maxIterations - 1;
     const shouldDisableTools = atMaxIterations;
     
-    this.logger.info('🔧 Tool configuration decision', {
+    this.logger.debug('🔧 Tool configuration decision', {
       hasToolResultsInHistory,
       iterations,
       maxIterations: state.maxIterations,
@@ -533,7 +533,7 @@ Remember: Output ONLY the JSON object, no additional text.`;
 
     try {
       // Log the actual messages being sent with full detail
-      this.logger.info('LLM Request Messages (detailed)', {
+      this.logger.debug('LLM Request Messages (detailed)', {
         messageCount: bedrockMessages.length,
         messages: bedrockMessages
       });
@@ -573,7 +573,7 @@ Remember: Output ONLY the JSON object, no additional text.`;
       const response = await this.bedrockClient.send(command);
       const processedResponse = await this.processStreamingResponse(response, streamingCallbacks);
       
-      this.logger.info('📤 LLM Response from Bedrock', {
+      this.logger.debug('📤 LLM Response from Bedrock', {
         contentBlocksCount: processedResponse.message.content.length,
         contentBlocks: processedResponse
       });
@@ -843,7 +843,7 @@ Remember: Output ONLY the JSON object, no additional text.`;
     const { toolCalls, streamingCallbacks, messages, clientState, clientContext, threadId, runId } = state;
     const toolResults: Record<string, any> = {};
 
-    this.logger.info('Executing tools', {
+    this.logger.debug('Executing tools', {
       toolCallsCount: toolCalls.length,
       toolNames: toolCalls.map(tc => tc.toolName),
       currentIterations: state.iterations,
@@ -891,7 +891,7 @@ Remember: Output ONLY the JSON object, no additional text.`;
     for (const toolCall of newToolCalls) {
       const { toolName, toolUseId, input } = toolCall;
       
-      this.logger.info('Tool execution started', {
+      this.logger.debug('Tool execution started', {
         toolName,
         toolUseId,
         input
@@ -913,7 +913,7 @@ Remember: Output ONLY the JSON object, no additional text.`;
         const result = await this.executeToolCall(toolName, enhancedInput);
         toolResults[toolUseId] = result;
         
-        this.logger.info('Tool execution completed', {
+        this.logger.debug('Tool execution completed', {
           toolName,
           toolUseId,
           resultType: typeof result,
@@ -940,7 +940,7 @@ Remember: Output ONLY the JSON object, no additional text.`;
     const newIterations = state.iterations + 1;
     const willContinue = newIterations < state.maxIterations && state.shouldContinue;
 
-    this.logger.info('All tools executed', {
+    this.logger.debug('All tools executed', {
       toolResultsCount: Object.keys(toolResults).length,
       successfulTools: Object.entries(toolResults).filter(([, result]) => !result.error).length,
       failedTools: Object.entries(toolResults).filter(([, result]) => result.error).length,
@@ -1355,12 +1355,12 @@ ${JSON.stringify(results, null, 2)}`;
   async processMessageWithCallbacks(
     messages: any[],  // Full conversation history from UI
     callbacks: StreamingCallbacks,
-    additionalInputs?: { state?: any; context?: any[]; tools?: any[]; threadId?: string; runId?: string; modelId?: string }
+    additionalInputs?: { state?: any; context?: any[]; tools?: any[]; threadId?: string; runId?: string; requestId?: string; modelId?: string }
   ): Promise<void> {
     try {
       // Set logger context for correlation with AG UI audits
-      if (additionalInputs?.threadId || additionalInputs?.runId) {
-        this.logger.setContext(additionalInputs.threadId, additionalInputs.runId);
+      if (additionalInputs?.threadId || additionalInputs?.runId || additionalInputs?.requestId) {
+        this.logger.setContext(additionalInputs.threadId, additionalInputs.runId, additionalInputs.requestId);
       }
 
       // Create initial state for todo-list approach with full conversation history

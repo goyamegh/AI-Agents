@@ -6,6 +6,7 @@ export class Logger extends BaseLogger {
   private currentLogFile: string = '';
   private threadId?: string;
   private runId?: string;
+  private requestId?: string;
 
   constructor(logDir: string = join(__dirname, '../../logs')) {
     super(logDir);
@@ -13,17 +14,23 @@ export class Logger extends BaseLogger {
   }
 
   /**
-   * Set thread and run IDs for correlation with AG UI audits
+   * Set thread, run, and request IDs for correlation with AG UI audits
    */
-  setContext(threadId?: string, runId?: string): void {
+  setContext(threadId?: string, runId?: string, requestId?: string): void {
     this.threadId = threadId;
     this.runId = runId;
+    this.requestId = requestId;
   }
 
   private updateLogFile(): void {
     const timestamp = this.getTimestamp();
     const dateStr = this.getDateString(timestamp.unix);
-    const hour = new Date(timestamp.unix).getHours().toString().padStart(2, '0');
+    // Get hour in PDT timezone to match log entries
+    const hour = new Date(timestamp.unix).toLocaleString('en-US', {
+      hour: '2-digit',
+      hour12: false,
+      timeZone: 'America/Los_Angeles'
+    });
     const newLogFile = join(this.logDir, `ai-agent-${dateStr}-${hour}.log`);
     
     if (this.currentLogFile !== newLogFile) {
@@ -38,10 +45,11 @@ export class Logger extends BaseLogger {
     const timestamp = this.getTimestamp();
     const pdtTime = this.toHumanTimestamp(timestamp.unix);
 
-    // Include thread_id and run_id if available
+    // Include thread_id, run_id, and request_id if available
     const context = [];
     if (this.threadId) context.push(`thread_id=${this.threadId}`);
     if (this.runId) context.push(`run_id=${this.runId}`);
+    if (this.requestId) context.push(`request_id=${this.requestId}`);
     const contextStr = context.length > 0 ? ` [${context.join(', ')}]` : '';
 
     const logEntry = `[${pdtTime}] ${contextStr} ${level}: ${message}`;

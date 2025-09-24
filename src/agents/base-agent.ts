@@ -25,7 +25,7 @@ export interface BaseAgent {
   processMessageWithCallbacks(
     messages: any[],  // Changed from string to array - full conversation history
     callbacks: StreamingCallbacks,
-    additionalInputs?: { state?: any; context?: any[]; tools?: any[]; threadId?: string; runId?: string; modelId?: string }
+    additionalInputs?: { state?: any; context?: any[]; tools?: any[]; threadId?: string; runId?: string; requestId?: string; modelId?: string }
   ): Promise<void>;
 
   /**

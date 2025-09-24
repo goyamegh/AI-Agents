@@ -67,7 +67,7 @@ Please use one of the available cluster names listed above.`;
       }
     }
 
-    this.logger.info(`Executing tool ${name} on ${this.serverName}`, { input });
+    this.logger.debug(`Executing tool ${name} on ${this.serverName}`, { input });
     
     // Validate tool exists and get its schema
     const tool = this.tools.find(t => t.name === name);
@@ -87,7 +87,7 @@ Please use one of the available cluster names listed above.`;
       // Reset circuit breaker after timeout
       if (currentTime - existingFailure.lastAttemptTime > this.CIRCUIT_BREAKER_RESET_TIME) {
         this.failedToolCalls.delete(failureKey);
-        this.logger.info(`Circuit breaker reset for ${name}`, { failureKey });
+        this.logger.debug(`Circuit breaker reset for ${name}`, { failureKey });
       } else if (existingFailure.attemptCount >= this.MAX_RETRY_ATTEMPTS) {
         const errorMessage = `CIRCUIT BREAKER ACTIVATED for tool "${name}":
 
@@ -174,12 +174,12 @@ WARNING: This failure has been recorded. After ${this.MAX_RETRY_ATTEMPTS} identi
       // Success: Clear any previous failures for this combination
       if (existingFailure) {
         this.failedToolCalls.delete(failureKey);
-        this.logger.info(`Tool ${name} succeeded after previous failures - circuit breaker cleared`, { 
-          previousFailures: existingFailure.attemptCount 
+        this.logger.debug(`Tool ${name} succeeded after previous failures - circuit breaker cleared`, {
+          previousFailures: existingFailure.attemptCount
         });
       }
       
-      this.logger.info(`Tool ${name} executed successfully on ${this.serverName}`, { result });
+      this.logger.debug(`Tool ${name} executed successfully on ${this.serverName}`, { result });
       return result;
     } catch (error) {
       // Record this failure for circuit breaker
@@ -249,7 +249,7 @@ WARNING: This failure has been recorded. After ${this.MAX_RETRY_ATTEMPTS} identi
         description: tool.description,
         inputSchema: tool.inputSchema
       }));
-      this.logger.info(`Loaded ${this.tools.length} tools from ${this.serverName}`);
+      this.logger.debug(`Loaded ${this.tools.length} tools from ${this.serverName}`);
     } catch (error) {
       this.logger.error(`Failed to load tools from ${this.serverName}`, { error });
       throw error;
@@ -278,7 +278,7 @@ WARNING: This failure has been recorded. After ${this.MAX_RETRY_ATTEMPTS} identi
       const defaultCluster = this.getDefaultOpenSearchCluster();
       if (defaultCluster) {
         enhancedInput.opensearch_cluster_name = defaultCluster;
-        this.logger.info(`Auto-injected default OpenSearch cluster parameter (failsafe)`, {
+        this.logger.debug(`Auto-injected default OpenSearch cluster parameter (failsafe)`, {
           toolName,
           clusterName: defaultCluster
         });

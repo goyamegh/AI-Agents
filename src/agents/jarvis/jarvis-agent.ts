@@ -23,7 +23,7 @@ export class JarvisAgent implements BaseAgent {
       region: region
     });
     
-    this.logger.info('Jarvis Agent initialized', {
+    this.logger.debug('Jarvis Agent initialized', {
       region: region,
       hasAwsAccessKey: !!process.env.AWS_ACCESS_KEY_ID,
       hasAwsSecretKey: !!process.env.AWS_SECRET_ACCESS_KEY,
@@ -36,14 +36,14 @@ export class JarvisAgent implements BaseAgent {
     configs: Record<string, MCPServerConfig>, 
     customSystemPrompt?: string
   ): Promise<void> {
-    this.logger.info('Initializing Jarvis Agent', {
+    this.logger.debug('Initializing Jarvis Agent', {
       serverCount: Object.keys(configs).length,
       servers: Object.keys(configs)
     });
 
     // Connect to all MCP servers
     for (const [name, config] of Object.entries(configs)) {
-      this.logger.info(`Connecting to MCP server: ${name}`);
+      this.logger.debug(`Connecting to MCP server: ${name}`);
       
       // Create appropriate client based on config type
       let client: BaseMCPClient;
@@ -57,7 +57,7 @@ export class JarvisAgent implements BaseAgent {
       
       try {
         await client.connect();
-        this.logger.info(`✅ Connected to ${name} (${config.type})`);
+        this.logger.debug(`✅ Connected to ${name} (${config.type})`);
       } catch (error) {
         const errorMessage = error instanceof Error ? error.message : String(error);
         this.logger.warn(`⚠️  Failed to connect to ${name}`, { error: errorMessage });
@@ -71,7 +71,7 @@ export class JarvisAgent implements BaseAgent {
     } else {
       // Always use dynamic system prompt that describes actual MCP tools
       this.systemPrompt = this.getDefaultSystemPrompt();
-      this.logger.info('Using dynamic system prompt with MCP tools', {
+      this.logger.debug('Using dynamic system prompt with MCP tools', {
         promptLength: this.systemPrompt.length,
         connectedServers: Object.keys(this.mcpClients).length
       });
@@ -286,7 +286,7 @@ Remember: Tool parameter validation errors should trigger immediate self-correct
   }
 
   async sendMessage(userMessage: string): Promise<void> {
-    this.logger.info('Received user message', { message: userMessage });
+    this.logger.debug('Received user message', { message: userMessage });
     console.log('\n🧑 User:', userMessage);
 
     // Add user message to CLI history
@@ -305,13 +305,13 @@ Remember: Tool parameter validation errors should trigger immediate self-correct
   async processMessageWithCallbacks(
     userMessage: string | any[],
     callbacks: StreamingCallbacks,
-    additionalInputs?: { state?: any; context?: any[]; tools?: any[]; threadId?: string; runId?: string; modelId?: string }
+    additionalInputs?: { state?: any; context?: any[]; tools?: any[]; threadId?: string; runId?: string; requestId?: string; modelId?: string }
   ): Promise<void> {
     // Handle both old signature (string) and new signature (messages array)
     const conversationHistory = Array.isArray(userMessage) ? userMessage : undefined;
     const modelId = additionalInputs?.modelId;
 
-    this.logger.info('Processing message with callbacks', {
+    this.logger.debug('Processing message with callbacks', {
       isArray: Array.isArray(userMessage),
       modelId
     });
@@ -526,7 +526,7 @@ Remember: Tool parameter validation errors should trigger immediate self-correct
               if (mcpClient) {
                 try {
                   const toolResult = await mcpClient.executeTool(actualToolName, toolStream.input);
-                  this.logger.info(`Tool execution successful`, {
+                  this.logger.debug(`Tool execution successful`, {
                     toolName: toolStream.name,
                     serverName,
                     actualToolName,

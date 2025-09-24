@@ -67,10 +67,17 @@ export abstract class BaseLogger {
   }
 
   /**
-   * Generate date string for file naming (YYYY-MM-DD)
+   * Generate date string for file naming (YYYY-MM-DD) in PDT timezone
    */
   protected getDateString(timestamp?: number): string {
     const date = timestamp ? new Date(timestamp) : new Date();
-    return date.toISOString().split('T')[0];
+    // Use PDT timezone to match log entries
+    const pdtDateString = date.toLocaleDateString('en-CA', {
+      timeZone: 'America/Los_Angeles',
+      year: 'numeric',
+      month: '2-digit',
+      day: '2-digit'
+    });
+    return pdtDateString; // Already in YYYY-MM-DD format
   }
 }
