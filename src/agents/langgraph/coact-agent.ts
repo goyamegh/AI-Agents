@@ -1138,7 +1138,9 @@ ${JSON.stringify(results, null, 2)}`;
         return true;
       })
       .map(msg => ({
-        role: msg.role || 'user',
+        // Convert 'tool' role to 'user' role for Bedrock compatibility
+        // Bedrock only accepts 'user' and 'assistant' roles
+        role: msg.role === "tool" ? "user" : (msg.role || 'user'),
         // If content is already an array (proper format), use it directly
         // This preserves toolUse and toolResult blocks
         content: Array.isArray(msg.content) ? msg.content : [{ text: msg.content || '' }]

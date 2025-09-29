@@ -339,11 +339,18 @@ Remember: Tool parameter validation errors should trigger immediate self-correct
     // Resolve model ID using priority: request -> default -> hardcoded
     const modelId = ModelConfigManager.resolveModelId(requestModelId);
 
+    // Convert 'tool' roles to 'user' roles for Bedrock compatibility
+    const bedrockMessages = conversationHistory.map(msg => ({
+      ...msg,
+      // Bedrock only accepts 'user' and 'assistant' roles
+      role: msg.role === "tool" ? "user" : msg.role
+    }));
+
     try {
       const command = new ConverseStreamCommand({
         modelId: modelId,
         system: [{ text: this.systemPrompt }],
-        messages: conversationHistory,
+        messages: bedrockMessages,
         toolConfig: tools.length > 0 ? { tools: tools } : undefined,
         inferenceConfig: {
           maxTokens: 4000,
@@ -353,7 +360,7 @@ Remember: Tool parameter validation errors should trigger immediate self-correct
 
       this.logger.debug('Sending request to Bedrock', {
         modelId: modelId,
-        messageCount: conversationHistory.length,
+        messageCount: bedrockMessages.length,
         toolCount: tools.length
       });
 
