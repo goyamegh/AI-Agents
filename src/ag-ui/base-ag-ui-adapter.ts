@@ -23,7 +23,6 @@ import {
   ToolCallArgsEvent,
   ToolCallEndEvent,
   ToolCallResultEvent,
-  StateSnapshotEvent,
   StateDeltaEvent,
   StepStartedEvent,
   StepFinishedEvent,
@@ -49,7 +48,7 @@ export interface BaseAGUIConfig {
 
 export class BaseAGUIAdapter {
   private agent: BaseAgent;
-  private logger: Logger;
+  protected logger: Logger;
   private auditLogger?: AGUIAuditLogger;
 
   // State management for AG UI events
@@ -208,17 +207,6 @@ export class BaseAGUIAdapter {
     );
 
     this.stateHistory.push(input.state || {});
-
-    this.emitAndAuditEvent(
-      {
-        type: EventType.STATE_SNAPSHOT,
-        snapshot: input.state || {},
-        timestamp: Date.now(),
-      } as StateSnapshotEvent,
-      observer,
-      input.threadId,
-      input.runId
-    );
 
     try {
       // Validate that we have messages

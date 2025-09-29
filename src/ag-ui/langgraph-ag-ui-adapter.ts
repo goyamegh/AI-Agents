@@ -15,7 +15,6 @@ import { Observable } from 'rxjs';
 import {
   EventType,
   BaseEvent,
-  StateSnapshotEvent,
   StateDeltaEvent,
   StepStartedEvent,
   StepFinishedEvent,
@@ -95,8 +94,11 @@ export class LangGraphAGUIAdapter extends BaseAGUIAdapter {
           // Track text message state
           if (event.type === EventType.TEXT_MESSAGE_START) {
             this.textMessageActive = true;
+            this.logger.debug(`🔍 [LangGraphAdapter] TEXT_MESSAGE_START received with messageId: ${(event as TextMessageStartEvent).messageId}`);
           } else if (event.type === EventType.TEXT_MESSAGE_END) {
             this.textMessageActive = false;
+
+            this.logger.debug(`🔍 [LangGraphAdapter] TEXT_MESSAGE_END received with messageId: ${(event as any).messageId}, current tracked messageId: ${this.currentMessageId}`);
 
             // Forward the TEXT_MESSAGE_END event FIRST
             this.emitAndAuditEvent(event, observer, threadId, runId);
@@ -127,31 +129,10 @@ export class LangGraphAGUIAdapter extends BaseAGUIAdapter {
           // Emit LangGraph-specific state after RUN_STARTED
           if (event.type === EventType.RUN_STARTED && !runStartedEmitted) {
             runStartedEmitted = true;
-            
+
             // Forward RUN_STARTED first
             this.emitAndAuditEvent(event, observer, threadId, runId);
-            
-            // Then emit LangGraph initial state
-            this.emitAndAuditEvent({
-              type: EventType.STATE_SNAPSHOT,
-              snapshot: {
-                ...this.graphState,
-                graphType: 'LangGraph',
-                currentNode: 'START',
-                graphPath: ['START'],
-                nodeExecutions: {},
-                nodes: ['processInput', 'callModel', 'executeTools', 'generateResponse'],
-                edges: {
-                  'START': ['processInput'],
-                  'processInput': ['callModel'],
-                  'callModel': ['executeTools', 'generateResponse'],
-                  'executeTools': ['callModel', 'generateResponse'],
-                  'generateResponse': ['END']
-                }
-              },
-              timestamp: Date.now()
-            } as StateSnapshotEvent, observer, threadId, runId);
-            
+
             return; // Don't forward the RUN_STARTED again
           }
           // Intercept and enhance specific events
@@ -162,11 +143,12 @@ export class LangGraphAGUIAdapter extends BaseAGUIAdapter {
             // Handle the first tool call during active text message
             if (this.textMessageActive && !this.hasToolCallsOccurred) {
               // This is the first tool call - emit TEXT_MESSAGE_END for current message
-              this.emitAndAuditEvent({
-                type: EventType.TEXT_MESSAGE_END,
-                messageId: this.currentMessageId,
-                timestamp: Date.now()
-              } as TextMessageEndEvent, observer, threadId, runId);
+              // this.logger.debug(`🔍 [LangGraphAdapter] First tool call detected, ending TEXT_MESSAGE with messageId: ${this.currentMessageId}`);
+              // this.emitAndAuditEvent({
+              //   type: EventType.TEXT_MESSAGE_END,
+              //   messageId: this.currentMessageId,
+              //   timestamp: Date.now()
+              // } as TextMessageEndEvent, observer, threadId, runId);
 
               this.textMessageActive = false;
               this.hasToolCallsOccurred = true;
@@ -182,22 +164,18 @@ export class LangGraphAGUIAdapter extends BaseAGUIAdapter {
             this.graphState.toolCallsCompleted = (this.graphState.toolCallsCompleted || 0) + 1;
             this.graphState.toolCallsPending = Math.max(0, (this.graphState.toolCallsPending || 0) - 1);
 
-            // Don't emit node transitions for tool events - they're handled during deferred processing
-            // if (this.graphState.iterations! < this.graphState.maxIterations!) {
-            //   this.emitNodeTransition(observer, 'callModel');
-            //   this.graphState.iterations = (this.graphState.iterations || 0) + 1;
-            // } else {\n            //   this.emitNodeTransition(observer, 'generateResponse');
-            // }
           } else if (event.type === EventType.TEXT_MESSAGE_START) {
             // Track message ID for dual text message approach
             this.currentMessageId = (event as TextMessageStartEvent).messageId;
             this.hasToolCallsOccurred = false;
             this.isSecondTextMessage = false;
+            this.logger.debug(`🔍 [LangGraphAdapter] Updating currentMessageId to: ${this.currentMessageId}`);
           } else if (event.type === EventType.TEXT_MESSAGE_CONTENT) {
             // Check if this is text continuation after tool calls
             if (this.hasToolCallsOccurred && !this.isSecondTextMessage && !this.textMessageActive) {
               // Start second text message for continuation
               const newMessageId = uuidv4();
+              this.logger.debug(`🔍 [LangGraphAdapter] Starting second TEXT_MESSAGE with new messageId: ${newMessageId}, previous messageId: ${this.currentMessageId}`);
               this.emitAndAuditEvent({
                 type: EventType.TEXT_MESSAGE_START,
                 messageId: newMessageId,
@@ -208,6 +186,7 @@ export class LangGraphAGUIAdapter extends BaseAGUIAdapter {
               this.currentMessageId = newMessageId;
               this.textMessageActive = true;
               this.isSecondTextMessage = true;
+              this.logger.debug(`🔍 [LangGraphAdapter] Updated currentMessageId to second message: ${this.currentMessageId}`);
             }
 
             // Update the message ID for content events if we're in the second message
@@ -245,20 +224,6 @@ export class LangGraphAGUIAdapter extends BaseAGUIAdapter {
               } as StepFinishedEvent, observer, threadId, runId);
             }
             this.activeSteps.clear();
-            
-            // Emit final graph traversal summary
-            this.emitAndAuditEvent({
-              type: EventType.STATE_SNAPSHOT,
-              snapshot: {
-                ...this.graphState,
-                currentNode: 'END',
-                graphPath: [...(this.graphState.graphPath || []), 'END'],
-                completionStatus: 'success',
-                totalIterations: this.graphState.iterations,
-                totalToolCalls: this.graphState.toolCallsCompleted
-              },
-              timestamp: Date.now()
-            } as StateSnapshotEvent, observer, threadId, runId);
           }
           
           // Filter events based on text message state - only defer state/step events
@@ -332,23 +297,6 @@ export class LangGraphAGUIAdapter extends BaseAGUIAdapter {
       timestamp: Date.now()
     } as StepStartedEvent);
 
-    // Store STATE_SNAPSHOT event
-    this.pendingStepEvents.push({
-      type: EventType.STATE_SNAPSHOT,
-      snapshot: {
-        graphType: 'LangGraph',
-        currentNode: nodeName,
-        previousNode,
-        graphPath: this.graphState.graphPath,
-        nodeExecutions: this.graphState.nodeExecutions,
-        iterations: this.graphState.iterations,
-        toolCallsPending: this.graphState.toolCallsPending,
-        toolCallsCompleted: this.graphState.toolCallsCompleted,
-        nodes: ['processInput', 'callModel', 'executeTools', 'generateResponse']
-      },
-      timestamp: Date.now()
-    } as StateSnapshotEvent);
-
     // Store STEP_FINISHED for previous node
     if (previousNode && previousNode !== 'START') {
       const previousStepName = `graph_node_${previousNode}`;
@@ -393,23 +341,6 @@ export class LangGraphAGUIAdapter extends BaseAGUIAdapter {
       },
       timestamp: Date.now()
     } as StepStartedEvent, observer, threadId, runId);
-
-    // Emit updated state snapshot with LangGraph-specific data
-    this.emitAndAuditEvent({
-      type: EventType.STATE_SNAPSHOT,
-      snapshot: {
-        graphType: 'LangGraph',
-        currentNode: nodeName,
-        previousNode,
-        graphPath: this.graphState.graphPath,
-        nodeExecutions: this.graphState.nodeExecutions,
-        iterations: this.graphState.iterations,
-        toolCallsPending: this.graphState.toolCallsPending,
-        toolCallsCompleted: this.graphState.toolCallsCompleted,
-        nodes: ['processInput', 'callModel', 'executeTools', 'generateResponse']
-      },
-      timestamp: Date.now()
-    } as StateSnapshotEvent, observer, threadId, runId);
 
     // Emit step finished for previous node
     if (previousNode && previousNode !== 'START') {
