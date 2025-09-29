@@ -537,22 +537,6 @@ Remember: Output ONLY the JSON object, no additional text.`;
         messageCount: bedrockMessages.length,
         messages: bedrockMessages
       });
-      
-      // this.logger.info('LLM Request to Bedrock', {
-      //   modelId: "us.anthropic.claude-sonnet-4-20250514-v1:0",
-      //   systemPromptLength: this.systemPrompt.length,
-      //   messageCount: bedrockMessages.length,
-      //   toolCount: toolConfig ? tools.length : 0,
-      //   toolsEnabled: !!toolConfig,
-      //   hasToolResultsInHistory,
-      //   iterations,
-      //   maxIterations: state.maxIterations,
-      //   atMaxIterations,
-      //   shouldDisableTools,
-      //   reason: shouldDisableTools ? 'max_iterations_reached' : 'tools_enabled',
-      //   maxTokens: 4096,
-      //   temperature: 0
-      // });
 
       // Emit warning and metric if we're forcing a final response due to max iterations
       if (atMaxIterations) {
