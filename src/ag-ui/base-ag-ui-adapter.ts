@@ -502,15 +502,7 @@ export class BaseAGUIAdapter {
             runId
           );
 
-        },
-        onToolResult: (toolName: string, toolUseId: string, result: any) => {
-          // Update tool completion tracking
-          this.toolCallsCompleted++;
-          this.toolCallsPending = Math.max(0, this.toolCallsPending - 1);
-
-          const actualToolName = toolName.split("__")[1] || toolName;
-
-          // 1. Emit TOOL_CALL_END event first
+          // Emit TOOL_CALL_END immediately after args (tool call definition complete)
           this.emitAndAuditEvent(
             {
               type: EventType.TOOL_CALL_END,
@@ -522,12 +514,20 @@ export class BaseAGUIAdapter {
             runId
           );
 
-          // 2. End current text message if still active (should not be active due to interruption)
+        },
+        onToolResult: (toolName: string, toolUseId: string, result: any) => {
+          // Update tool completion tracking
+          this.toolCallsCompleted++;
+          this.toolCallsPending = Math.max(0, this.toolCallsPending - 1);
+
+          const actualToolName = toolName.split("__")[1] || toolName;
+
+          // 1. End current text message if still active (should not be active due to interruption)
           if (this.textMessageManager.isMessageActive()) {
             this.textMessageManager.endMessage(observer, threadId, runId);
           }
 
-          // 3. Emit TOOL_CALL_RESULT event
+          // 2. Emit TOOL_CALL_RESULT event
           this.emitAndAuditEvent(
             {
               type: EventType.TOOL_CALL_RESULT,
@@ -541,7 +541,7 @@ export class BaseAGUIAdapter {
             runId
           );
 
-          // 4. Resume text message if there are more tools pending or if this is the last tool
+          // 3. Resume text message if there are more tools pending or if this is the last tool
           if (this.toolCallsPending === 0) {
             // All tools completed - start new text message for continuation
             this.textMessageManager.resumeAfterTools(observer, threadId, runId);
